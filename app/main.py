@@ -2,6 +2,7 @@ import uuid
 from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
 from fastapi.responses import Response
+from pydantic import AwareDatetime
 from sqlalchemy import select
 from .auth import authenticated_identity
 from .config import Settings
@@ -63,6 +64,12 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
     def twin(subject_id: str, purpose: str = Query(...), identity=Depends(authenticated_identity), request_id=Depends(correlation)):
         return service.twin(identity, subject_id, purpose, request_id)
 
+    @app.get("/subjects/{subject_id}/twin/history")
+    def historical_twin(subject_id: str, valid_at: AwareDatetime = Query(...),
+                        system_at: AwareDatetime = Query(...), purpose: str = Query(...),
+                        identity=Depends(authenticated_identity), request_id=Depends(correlation)):
+        return service.historical_twin(identity, subject_id, purpose, valid_at, system_at, request_id)
+
     @app.get("/subjects/{subject_id}/evidence/{evidence_id}")
     def read_evidence(subject_id: str, evidence_id: str, purpose: str = Query(...),
                       identity=Depends(authenticated_identity), request_id=Depends(correlation)):
@@ -87,4 +94,3 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
 
 
 app = create_app()
-

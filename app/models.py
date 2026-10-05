@@ -15,6 +15,7 @@ class Subject(Base):
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
     wrapped_key: Mapped[bytes | None] = mapped_column(LargeBinary)
     key_reference: Mapped[str | None] = mapped_column(String(512))
+    restricted: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -109,4 +110,3 @@ class AuditLog(Base):
     outcome: Mapped[str] = mapped_column(String(40))
     correlation_id: Mapped[str] = mapped_column(String(128))
     timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
-

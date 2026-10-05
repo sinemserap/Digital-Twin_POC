@@ -14,6 +14,11 @@ def canonical(data) -> bytes:
     return json.dumps(data, sort_keys=True, separators=(",", ":"), default=str).encode()
 
 
+def as_utc(value: datetime) -> datetime:
+    # SQLite drops tzinfo; existing naive Part 1 timestamps are interpreted as UTC.
+    return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+
+
 class ClaimService:
     def __init__(self, session_factory, evidence_store, key_protector):
         self.sessions = session_factory
@@ -47,6 +52,16 @@ class ClaimService:
                 self.audit(db, identity, subject_id, purpose, operation, "denied", correlation)
                 db.commit()
                 raise HTTPException(404, "subject not found")
+        # These are CURRENT access conditions, even for a query about the past.
+        # Check before selecting payloads, unwrapping a key, or replaying a receipt.
+        if subject.restricted:
+            self.audit(db, identity, subject_id, purpose, operation, "restricted", correlation)
+            db.commit()
+            raise HTTPException(403, "subject is restricted")
+        if not subject.wrapped_key or not subject.key_reference:
+            self.audit(db, identity, subject_id, purpose, operation, "erased", correlation)
+            db.commit()
+            raise HTTPException(410, "subject payload has been erased")
         return subject
 
     def import_subject(self, identity, body, correlation):
@@ -155,8 +170,9 @@ class ClaimService:
                 source_system=body.source.system, source_record_id=body.source.record_id,
                 source_authority=body.source.authority, source_version=body.source.version,
                 evidence_id=body.evidence.evidence_id, evidence_uri=evidence_uri, evidence_hash=body.evidence.hash.lower(),
-                purpose_ids=[body.purpose_id], valid_from=body.valid_from, valid_to=body.valid_to,
-                observed_at=body.observed_at, retention_rule=body.retention_rule,
+                purpose_ids=[body.purpose_id], valid_from=as_utc(body.valid_from),
+                valid_to=as_utc(body.valid_to) if body.valid_to else None,
+                observed_at=as_utc(body.observed_at), retention_rule=body.retention_rule,
                 confidence_band=body.confidence_band, event_sequence=seq, record_hash=record_hash)
             db.add(claim); db.flush()
             db.add(EventLedger(tenant_id=identity.tenant_id, subject_id=subject.id, claim_id=claim.id,
@@ -206,6 +222,63 @@ class ClaimService:
             db.commit()
             return {"subject_id": subject.id, "predicates": result}
 
+    def historical_twin(self, identity, subject_id, purpose, valid_at, system_at, correlation):
+        """Reconstruct from retained claims, never from their mutable current status."""
+        with self.sessions() as db:
+            self.authorize(db, identity, purpose, "read", subject_id, correlation)
+            if purpose != "audit_reconstruction":
+                self.audit(db, identity, subject_id, purpose, "twin_reconstruction", "denied", correlation)
+                db.commit()
+                raise HTTPException(403, "historical reads require audit_reconstruction")
+            subject = self._subject(db, identity, subject_id, purpose, "twin_reconstruction", correlation)
+            valid_at, system_at = as_utc(valid_at), as_utc(system_at)
+            claims = list(db.scalars(select(Claim).where(
+                Claim.subject_id == subject.id, Claim.tenant_id == identity.tenant_id,
+                Claim.ingested_at <= system_at, Claim.valid_from <= valid_at,
+                (Claim.valid_to.is_(None) | (Claim.valid_to > valid_at))
+            ).order_by(Claim.event_sequence, Claim.id)))
+            key = self.keys.unwrap(subject.id, subject.wrapped_key, subject.key_reference)
+            result = {}
+            for predicate in PREDICATES:
+                candidates = [c for c in claims if c.predicate == predicate]
+                if not candidates:
+                    result[predicate] = {"state": "unknown", "reason": "no_claim",
+                                         "conflict_state": "none", "claims": []}
+                    continue
+                # A version only supersedes the same source within its validity
+                # interval. Later knowledge must not affect an earlier cutoff.
+                versions = {}
+                for claim in candidates:
+                    versions[claim.source_system] = max(versions.get(claim.source_system, -1), claim.source_version)
+                candidates = [c for c in candidates if c.source_version == versions[c.source_system]]
+                values, provenance = [], []
+                for claim in candidates:
+                    value = json.loads(decrypt(key, claim.value_ciphertext, f"{subject.id}:{predicate}".encode()))
+                    values.append(canonical(value))
+                    provenance.append({
+                        "claim_id": claim.id, "value": value,
+                        "source": claim.source_system, "source_record_id": claim.source_record_id,
+                        "source_version": claim.source_version, "authority": claim.source_authority,
+                        "evidence_id": claim.evidence_id, "evidence_uri": claim.evidence_uri,
+                        "evidence_hash": claim.evidence_hash, "event_sequence": claim.event_sequence,
+                        "record_hash": claim.record_hash, "purpose_ids": claim.purpose_ids,
+                        "valid_from": as_utc(claim.valid_from).isoformat(),
+                        "valid_to": as_utc(claim.valid_to).isoformat() if claim.valid_to else None,
+                        "observed_at": as_utc(claim.observed_at).isoformat(),
+                        "ingested_at": as_utc(claim.ingested_at).isoformat(),
+                        "confidence": claim.confidence_band,
+                    })
+                if len(set(values)) > 1:
+                    result[predicate] = {"state": "unknown", "reason": "contested",
+                                         "conflict_state": "unresolved", "claims": provenance}
+                else:
+                    result[predicate] = {"state": "known", "value": provenance[0]["value"],
+                                         "conflict_state": "none", "claims": provenance}
+            self.audit(db, identity, subject.id, purpose, "twin_reconstruction", "allowed", correlation)
+            db.commit()
+            return {"subject_id": subject.id, "valid_at": valid_at.isoformat(),
+                    "system_at": system_at.isoformat(), "predicates": result}
+
     def verify_ledger(self, db, subject_id):
         previous = "0" * 64
         for event in db.scalars(select(EventLedger).where(EventLedger.subject_id == subject_id).order_by(EventLedger.sequence)):
@@ -213,4 +286,3 @@ class ClaimService:
                 return False
             previous = event.record_hash
         return True
-
