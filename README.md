@@ -46,7 +46,45 @@ Configure `AZURE_BLOB_CONNECTION_STRING` and `AZURE_BLOB_CONTAINER` to select Az
 
 The PostgreSQL reference migrations are `migrations/001_initial.sql` and `migrations/002_subject_restriction.sql`. **For an existing Part 1 database, apply 002 once before starting this version**; SQLAlchemy `create_all` only creates missing tables and cannot add the new column. Fresh local databases created by the app already include it. `(tenant_id, source_system, source_person_ref)` prevents duplicate twins and `(tenant_id, idempotency_key)` serializes mutation retries. Higher same-source versions supersede current claims while retaining all ledger events. Older versions remain historical. Same-version disagreement and different-source disagreement are retained and returned as `contested`; Part 1 intentionally does not resolve them.
 
-Run all acceptance tests with `pytest`. Tests use SQLite only as a fast isolated SQLAlchemy test backend; runtime defaults to PostgreSQL.
+Run the fast SQLite acceptance suite with `python -m pytest`. PostgreSQL-only cases skip unless an explicit test database URL is supplied; runtime defaults to PostgreSQL.
+
+### PostgreSQL acceptance
+
+Use a disposable PostgreSQL 16 database. The test role needs permission to create
+schemas. Each test creates a uniquely named schema, executes the actual
+`001_initial.sql` and `002_subject_restriction.sql` migrations, and drops only
+that schema afterwards. Existing application tables are not reset.
+
+```bash
+python -m pytest --postgres-url postgresql+psycopg://edt:edt@localhost:5432/edt_test
+python -m pytest --postgres-url postgresql+psycopg://edt:edt@localhost:5432/edt_test --postgres-timezone America/New_York
+```
+
+These commands run the same 30 Part 1/F01c acceptance cases on PostgreSQL,
+including late corrections, retained conflicts/evidence, current restriction
+and erasure gates before payload access, and post-erasure restart. Five
+PostgreSQL-only cases add:
+
+* Upgrade of populated Part 1 tables with migration 002, preserving encrypted
+  claims, ledger hashes, bindings, keys and replay receipts; default false and
+  NOT NULL restriction state; denial after restriction and restart.
+* Actual `timestamptz` column types, both instants of a DST repeated hour,
+  equivalent offsets, and one-microsecond validity/knowledge boundaries.
+* Forced concurrent receipt inserts for identical and changed retries:
+  one accepted claim, receipt and ledger event; identical responses or 409.
+* Forced concurrent source imports: one subject/binding and no orphan subject.
+
+The populated upgrade fixture seeds genuine records via the existing API,
+removes the new restriction column to restore the Part 1 table shape, then
+applies migration 002 and compares the retained rows before/after.
+`.github/workflows/postgres-acceptance.yml` repeats acceptance on PostgreSQL 16
+with UTC and America/New_York sessions and runs the SQLite regression suite.
+
+Local validation on 6 October 2026: PostgreSQL 16.15 / Python 3.12, **35 passed**
+in each timezone; SQLite **30 passed** (five PostgreSQL-only cases skipped).
+No production parity defect was found, so application code and SQL migrations
+were left unchanged. Evidence and key protection use the existing local test
+adapters; Azure integration was not exercised.
 
 ## Bitemporal reconstruction (F01c)
 

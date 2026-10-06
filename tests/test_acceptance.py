@@ -12,8 +12,12 @@ from app.security import decrypt
 
 
 @pytest.fixture()
-def env(tmp_path):
-    app = create_app(f"sqlite:///{tmp_path}/edt.db", str(tmp_path / "evidence"))
+def env(tmp_path, request):
+    if request.config.getoption("--postgres-url"):
+        database_url = request.getfixturevalue("postgres_database")
+    else:
+        database_url = f"sqlite:///{tmp_path}/edt.db"
+    app = create_app(database_url, str(tmp_path / "evidence"))
     with TestClient(app) as client:
         yield client, app
 
@@ -378,7 +382,8 @@ def test_current_rights_precede_history_payload_selection_and_survive_restart(en
         assert db.scalar(select(AuditLog.id).where(AuditLog.operation == "twin_reconstruction", AuditLog.outcome == rights_state))
     # A fresh service has no allowed-read cache and cannot reconstruct from the
     # retained ciphertext without the subject's current key/access state.
-    restarted = create_app(str(app.state.engine.url), str(app.state.service.evidence.root))
+    restarted = create_app(app.state.engine.url.render_as_string(hide_password=False),
+                           str(app.state.service.evidence.root))
     monkeypatch.setattr(restarted.state.service.keys, "unwrap", forbidden)
     with TestClient(restarted) as fresh_client:
         assert history(fresh_client, sid).status_code == status
