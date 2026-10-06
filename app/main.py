@@ -1,6 +1,6 @@
 import uuid
 from contextlib import asynccontextmanager
-from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.responses import Response
 from pydantic import AwareDatetime
 from sqlalchemy import select
@@ -13,6 +13,7 @@ from .models import Claim, PredicateRegistry, PurposeRegistry
 from .schemas import ClaimMutation, SubjectImport
 from .security import LocalKeyProtector
 from .service import ClaimService
+from .importer import ControlledImporter
 
 
 def create_app(database_url: str | None = None, evidence_dir: str | None = None, key_protector=None):
@@ -48,6 +49,26 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
 
     def correlation(x_correlation_id: str | None = Header(None)):
         return x_correlation_id or str(uuid.uuid4())
+
+    importer = ControlledImporter(sessions, engine, service)
+    app.state.importer = importer
+
+    @app.post('/imports/ATS')
+    async def import_file(request: Request, identity=Depends(authenticated_identity), request_id=Depends(correlation)):
+        importer.authorize(identity)
+        if request.headers.get('content-type', '').split(';')[0] != 'application/x-ndjson':
+            raise HTTPException(415, 'JSONL_REQUIRED')
+        raw = bytearray()
+        async for chunk in request.stream():
+            raw.extend(chunk)
+            if len(raw) > importer.MAX_BYTES:
+                raise HTTPException(413, 'FILE_SIZE_INVALID')
+        from starlette.concurrency import run_in_threadpool
+        return await run_in_threadpool(importer.import_file, identity, bytes(raw), request_id)
+
+    @app.get('/imports/ATS/freshness')
+    def source_freshness(identity=Depends(authenticated_identity)):
+        return importer.freshness(identity)
 
     @app.get("/health")
     def health(): return {"status": "ok", "service": "Claim and Evidence Service"}
@@ -94,3 +115,4 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
 
 
 app = create_app()
+
