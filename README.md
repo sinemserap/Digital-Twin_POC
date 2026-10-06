@@ -121,3 +121,82 @@ The minimal rights hook is the current `subject.restricted` flag (default false)
 Tests set the current flag or clear the wrapped key/key reference directly as controlled fixtures. They verify that an earlier historical timestamp cannot bypass current rights, payload selection/decryption never starts, and a fresh service still denies access with the encrypted claims, evidence and hash-verifiable ledger retained. This is protection against reconstruction from retained ciphertext after key removal; restoring an old backup containing the wrapped key would undo that removal. Recovery must reapply current restrictions and erasure before enabling reads. Backup/key lifecycle and full cross-store deletion remain outside this bounded change.
 
 Acceptance coverage includes late corrections, both timestamp cutoffs, inclusive/exclusive validity boundaries, timezone offsets, older late arrivals, same-version and different-source conflicts, evidence references, access isolation, audit records, current rights and post-erasure restart. Run `pytest` for this coverage and the original Part 1 checks.
+
+
+## F08 bounded controlled source import
+
+Built against PR #1 commit `ad339091` and the Drive `EDT_v3-1_Features.xlsx`
+F08 acceptance criteria (23 October). Reuses the existing final F08 decisions:
+JSONL v1, ATS authority limited to `offer_status`, `offered_role` (from `role_ref`),
+`start_date`, monotonic source versions and delta/upsert semantics. Absence from
+an import never deletes a fact or completes a task.
+
+Upload `fixtures/offer-update-v1.jsonl` to `POST /imports/ATS` with
+`Content-Type: application/x-ndjson` and the mocked identity headers using
+`X-Roles: data_administrator`. `fixtures/offer-update-v1.schema.json` describes
+both the first-line header and remaining offer/update records. The required
+`authenticated_account_id` is a synthetic binding assertion: it creates the
+first offer's binding and must match that binding thereafter; it is never a
+fuzzy match or account-rebinding request. The only source is the fixed ATS
+fixture. Deployment must replace mocked trusted headers with authenticated JWTs.
+
+File limits are 256 KiB and 100 records. The gate rejects malformed UTF-8/JSON,
+duplicate JSON keys, unknown fields/source/schema, foreign header tenant,
+wrong count/hash and future generation time before any canonical mutation.
+`content_hash` is SHA-256 of the exact record lines joined with LF and one
+trailing LF; exclude the header. No optional signature contract is enabled.
+
+Each complete record is validated before F01 submission. Invalid records,
+foreign tenants, account/offer identity mismatches and restricted/erased
+subjects produce **quarantined operational outcomes**; no raw record is persisted
+in quarantine. Reports contain positions, hashes, reason codes and F01 references,
+never offer values. `offer_updated` with no binding is held without creating a
+subject. Fix held/quarantined inputs and submit a new snapshot; a completed
+file remains an immutable reported attempt. Valid neighboring records continue.
+This operational quarantine is separate from F01 model-output hypotheses.
+
+`ClaimService.import_offer` is the transactional F01 record entry point. It
+resolves/creates the subject binding and uses the existing claim mutation logic
+for all three mapped facts inside one database transaction, with one batch
+receipt. A failure rolls back the entire subject/claim/ledger/receipt set.
+Source version/effective/observed time map to F01 unchanged; ingestion time is
+server-generated. Higher versions supersede; lower unseen versions remain
+historical; conflicting same-version values are contested. `accepted` in the
+run report includes successful higher versions; F01 result references retain
+per-claim statuses. History remains available through the F01 historical endpoint.
+
+The adapter owns only `import_run` operational state. Exact completed files
+short-circuit; incomplete runs resume from durable outcomes. F01 record receipts
+prevent duplication when a crash follows canonical commit but precedes reporting.
+Identical records in different files reuse F01 references. PostgreSQL session
+advisory locks serialize this one source per tenant across adapter instances;
+SQLite demo mode requires a single service process and uses a thread lock.
+No live ATS connectivity, polling, workflow state or broad reconciliation exists.
+
+`GET /imports/ATS/freshness` requires the administrator role and returns
+`missing`, `fresh` or `stale`, last successful source generation time, age and
+the configured seven-day threshold. Failed/all-invalid files never advance
+freshness; an exact file replay never refreshes its timestamp. Status is isolated
+by identity tenant and always exposes `task_completion=unknown`. This is an
+operator API, not a candidate/task UI or a change to `/twin`'s `stale` field.
+
+### Evidence and remaining fuller-design dependencies
+
+F01 encrypts canonical record snapshots under the subject key and each claim
+references its evidence. Neither F08 metadata nor quarantine stores personal
+payloads. This smallest slice **does not implement the fuller final F08 document's
+shared raw-file evidence key/manifest lifecycle**, malware scanning, optional
+file signatures, or full F02/F07 retention/deletion orchestration. Raw uploads
+are transient and not retained. A rolled-back database transaction can leave
+an encrypted unreferenced object in the evidence adapter; production object
+cleanup/recovery remains an F01/F02 storage concern. Current subject restriction
+and erasure gates prevent new import processing from restoring erased data.
+
+Apply `migrations/003_controlled_import.sql` after 001/002 when upgrading
+PostgreSQL. It adds only F08 operational metadata. Fresh local startup creates
+the table. The opt-in PostgreSQL tests now apply all three actual migrations.
+`python -m pytest` covers original F01 behavior plus bounded F08 file gates,
+quarantine/hold, identity checks, evidence, atomic rollback, duplicate replay,
+late/change/conflict handling, crash/resume, concurrent imports, restart,
+restriction/erasure and missing/stale-source status. No cloud deployment is
+claimed by this implementation.
