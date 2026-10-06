@@ -15,5 +15,5 @@ DENIED_PURPOSES = {
     "recruitment_evaluation", "performance_evaluation", "workforce_monitoring",
     "marketing", "model_training_cross_customer",
 }
-UNKNOWN_REASONS = {"no_claim", "expired", "contested", "source_missing"}
+UNKNOWN_REASONS = {"no_claim", "expired", "not_yet_valid", "contested", "source_missing"}
 

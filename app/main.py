@@ -12,11 +12,13 @@ from .evidence import AzureBlobEvidenceStore, LocalEvidenceStore
 from .models import Claim, PredicateRegistry, PurposeRegistry
 from .schemas import ClaimMutation, SubjectImport
 from .security import LocalKeyProtector
-from .service import ClaimService
+from .service import ClaimService, F01ImportContract
 from .importer import ControlledImporter
+from .source_registry import default_registry
 
 
-def create_app(database_url: str | None = None, evidence_dir: str | None = None, key_protector=None):
+def create_app(database_url: str | None = None, evidence_dir: str | None = None, key_protector=None,
+               source_registry=None, malware_scanner=None):
     settings = Settings()
     engine = build_engine(database_url or settings.database_url)
     sessions = build_session_factory(engine)
@@ -50,11 +52,14 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
     def correlation(x_correlation_id: str | None = Header(None)):
         return x_correlation_id or str(uuid.uuid4())
 
-    importer = ControlledImporter(sessions, engine, service)
+    # The adapter receives only the F01 import contract, never the service or its sessions.
+    importer = ControlledImporter(engine, F01ImportContract(service), source_registry or default_registry(),
+                                  malware_scanner)
     app.state.importer = importer
 
-    @app.post('/imports/ATS')
-    async def import_file(request: Request, identity=Depends(authenticated_identity), request_id=Depends(correlation)):
+    @app.post('/imports/{source_system_id}')
+    async def import_file(source_system_id: str, request: Request, identity=Depends(authenticated_identity),
+                          request_id=Depends(correlation)):
         importer.authorize(identity)
         if request.headers.get('content-type', '').split(';')[0] != 'application/x-ndjson':
             raise HTTPException(415, 'JSONL_REQUIRED')
@@ -64,11 +69,11 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
             if len(raw) > importer.MAX_BYTES:
                 raise HTTPException(413, 'FILE_SIZE_INVALID')
         from starlette.concurrency import run_in_threadpool
-        return await run_in_threadpool(importer.import_file, identity, bytes(raw), request_id)
+        return await run_in_threadpool(importer.import_file, identity, source_system_id, bytes(raw), request_id)
 
-    @app.get('/imports/ATS/freshness')
-    def source_freshness(identity=Depends(authenticated_identity)):
-        return importer.freshness(identity)
+    @app.get('/imports/{source_system_id}/freshness')
+    def source_freshness(source_system_id: str, identity=Depends(authenticated_identity)):
+        return importer.freshness(identity, source_system_id)
 
     @app.get("/health")
     def health(): return {"status": "ok", "service": "Claim and Evidence Service"}

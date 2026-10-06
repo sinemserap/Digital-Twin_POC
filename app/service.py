@@ -1,12 +1,14 @@
 import base64
 import json
 import os
+import uuid
 from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from fastapi import HTTPException
 from .constants import ALLOWED_PURPOSES, AUTHORITATIVE, DENIED_PURPOSES, PREDICATES, SELF_DECLARED
-from .models import AuditLog, Claim, EventLedger, MutationReceipt, Subject, SubjectBinding
+from .models import (AuditLog, Claim, EventLedger, ImportFileEvidence, ImportFileEvidenceSubject,
+                     MutationReceipt, Subject, SubjectBinding)
 from .security import Identity, decrypt, encrypt, sha256
 
 
@@ -72,6 +74,10 @@ class ClaimService:
                 SubjectBinding.source_system == body.source_system,
                 SubjectBinding.source_person_ref == body.source_person_ref))
             if binding:
+                if binding.authenticated_account_id is None:
+                    # A controlled import created this binding without an account (F08 schema v1
+                    # carries no account field); the first account assertion binds it.
+                    binding.authenticated_account_id = body.authenticated_account_id
                 self.audit(db, identity, binding.subject_id, "source_sync", "subject_import", "replayed", correlation)
                 db.commit()
                 return {"subject_id": binding.subject_id, "created": False}
@@ -99,7 +105,9 @@ class ClaimService:
         with self.sessions() as db:
             return self._mutate(db, identity, subject_id, body, correlation)
 
-    def _mutate(self, db, identity, subject_id, body, correlation, commit=True):
+    def _mutate(self, db, identity, subject_id, body, correlation, commit=True, stored_evidence_uri=None):
+        """One claim mutation. stored_evidence_uri lets an atomic record set share one
+        per-record evidence snapshot already written under the subject key."""
         self.authorize(db, identity, body.purpose_id, "mutation", subject_id, correlation)
         subject = self._subject(db, identity, subject_id, body.purpose_id, "mutation", correlation)
         if body.predicate not in PREDICATES:
@@ -142,7 +150,8 @@ class ClaimService:
         key = self.keys.unwrap(subject.id, subject.wrapped_key, subject.key_reference)
         value_bytes = canonical(body.value)
         ciphertext = encrypt(key, value_bytes, f"{subject.id}:{body.predicate}".encode())
-        evidence_uri = self.evidence.put(identity.tenant_id, subject.id, body.evidence.evidence_id, evidence_content, key)
+        evidence_uri = stored_evidence_uri or self.evidence.put(
+            identity.tenant_id, subject.id, body.evidence.evidence_id, evidence_content, key)
         existing_claims = list(db.scalars(select(Claim).where(
             Claim.subject_id == subject.id, Claim.predicate == body.predicate,
             Claim.status.in_(["current", "contested"]))).all())
@@ -216,6 +225,9 @@ class ClaimService:
                     valid_to = c.valid_to
                     if valid_to and (valid_to if valid_to.tzinfo else valid_to.replace(tzinfo=timezone.utc)) <= now:
                         result[predicate] = {"state": "unknown", "reason": "expired"}
+                        continue
+                    if as_utc(c.valid_from) > now:
+                        result[predicate] = {"state": "unknown", "reason": "not_yet_valid"}
                         continue
                     value = json.loads(decrypt(key, c.value_ciphertext, f"{subject.id}:{predicate}".encode()))
                     ingested = c.ingested_at if c.ingested_at.tzinfo else c.ingested_at.replace(tzinfo=timezone.utc)
@@ -295,66 +307,171 @@ class ClaimService:
         return True
 
 
-    def import_offer(self, identity, record, record_key, correlation):
-        """F01 atomic record boundary; adapter never owns canonical credentials.
+    # ----- F01 import contract used by the F08 controlled source import adapter -----
 
-        Resolve/create the binding and commit all mapped claims in one transaction.
-        Called only after the controlled adapter has validated the entire record.
+    IMPORT_FILE_RETENTION = "preboarding_source_evidence_file"
+    IMPORT_SNAPSHOT_RETENTION = "preboarding_source_evidence"
+
+    def store_import_file_evidence(self, identity, source_system_id, file_key, snapshot_id, file_hash,
+                                   content, manifest, correlation):
+        """File-level import evidence under a separate file key (design §1.8, D8).
+
+        Idempotent on the file identity: a resumed run reuses the stored evidence.
+        """
+        with self.sessions() as db:
+            self.authorize(db, identity, "source_sync", "mutation", None, correlation)
+            existing = db.get(ImportFileEvidence, file_key)
+            if existing and existing.tenant_id == identity.tenant_id:
+                return self._file_evidence_ref(existing)
+            file_dek = os.urandom(32)
+            wrapped, reference = self.keys.wrap("import-file:" + file_key, file_dek)
+            # A fresh object name per attempt keeps overwrite=False object stores safe on retry.
+            evidence_uri = self.evidence.put(identity.tenant_id, "import-files", str(uuid.uuid4()), content, file_dek)
+            # file_hash is the record-payload hash from the header (the file identity); upload_hash
+            # covers the exact stored bytes including the header line.
+            manifest = {**manifest, "upload_hash": sha256(content)}
+            evidence = ImportFileEvidence(id=file_key, tenant_id=identity.tenant_id, source_system_id=source_system_id,
+                snapshot_id=snapshot_id, file_hash=file_hash, wrapped_key=wrapped, key_reference=reference,
+                evidence_uri=evidence_uri, manifest=manifest, retention_rule=self.IMPORT_FILE_RETENTION)
+            db.add(evidence)
+            self.audit(db, identity, None, "source_sync", "import_file_evidence", "accepted", correlation)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+                return self._file_evidence_ref(db.get(ImportFileEvidence, file_key))
+            return self._file_evidence_ref(evidence)
+
+    @staticmethod
+    def _file_evidence_ref(evidence):
+        return {"file_evidence_id": evidence.id, "file_hash": evidence.file_hash,
+                "evidence_uri": evidence.evidence_uri, "manifest_hash": sha256(canonical(evidence.manifest)),
+                "retention_rule": evidence.retention_rule, "key_destroyed": evidence.wrapped_key is None}
+
+    def read_import_file_evidence(self, db, file_evidence_id):
+        """Decrypt the stored raw file; 410 once its key is destroyed. No endpoint exposes it."""
+        evidence = db.get(ImportFileEvidence, file_evidence_id)
+        if not evidence:
+            raise HTTPException(404, "file evidence not found")
+        if not evidence.wrapped_key or not evidence.key_reference:
+            raise HTTPException(410, "file evidence key has been destroyed")
+        key = self.keys.unwrap("import-file:" + evidence.id, evidence.wrapped_key, evidence.key_reference)
+        name = evidence.evidence_uri.rsplit("/", 1)[-1]
+        return self.evidence.read_verified(evidence.evidence_uri, name, evidence.manifest["upload_hash"], key)
+
+    def destroy_import_file_key(self, db, file_evidence_id, reason):
+        """Retention end (F07) or erasure of any contained subject (F02). Manifest is kept."""
+        evidence = db.get(ImportFileEvidence, file_evidence_id)
+        if evidence and evidence.wrapped_key is not None:
+            evidence.wrapped_key, evidence.key_reference = None, None
+            evidence.key_destroyed_at, evidence.key_destroyed_reason = datetime.now(timezone.utc), reason
+
+    def crypto_shred_subject(self, db, subject_id):
+        """Rights-triggered erasure hook executed by F02: destroy the subject key and the key of
+        every shared import file containing the subject. Other subjects keep their own snapshots."""
+        subject = db.get(Subject, subject_id)
+        subject.wrapped_key, subject.key_reference = None, None
+        for link in db.scalars(select(ImportFileEvidenceSubject).where(ImportFileEvidenceSubject.subject_id == subject_id)):
+            self.destroy_import_file_key(db, link.file_evidence_id, "subject_erasure")
+
+    def submit_import_record(self, identity, record, keys, snapshot, file_evidence_id, correlation):
+        """F01 atomic record-scoped mutation set (design §1.2 step 4, D1).
+
+        Resolve the deterministic binding, store one per-record snapshot under the subject key,
+        validate and commit every mapped claim in one transaction. If one mapped claim fails,
+        nothing from the record is accepted. Called only after the adapter validated the record.
         """
         from .schemas import ClaimMutation
+        from .source_registry import ATS_FIELD_MAPPING
+        values = record.model_dump(mode="json")
+        # Registered authority only (F01 registry entry for the ATS source, D11).
+        mapped = [(predicate, values[field]) for field, predicate in ATS_FIELD_MAPPING.items()]
         if record.tenant_id != identity.tenant_id:
             raise HTTPException(422, "WRONG_TENANT")
         with self.sessions() as db:
             self.authorize(db, identity, "source_sync", "mutation", None, correlation)
-            binding = db.scalar(select(SubjectBinding).where(
+            bindings = list(db.scalars(select(SubjectBinding).where(
                 SubjectBinding.tenant_id == identity.tenant_id,
-                SubjectBinding.source_system == 'ATS',
-                SubjectBinding.source_person_ref == record.source_person_ref))
-            if binding:
-                if binding.authenticated_account_id != record.authenticated_account_id:
-                    raise HTTPException(422, 'SUBJECT_BINDING_MISMATCH')
-                subject = db.scalar(select(Subject).where(Subject.id == binding.subject_id).with_for_update())
-                self._subject(db, identity, subject.id, 'source_sync', 'mutation', correlation)
+                SubjectBinding.source_system == snapshot["source_system_id"],
+                SubjectBinding.source_person_ref == record.source_person_ref)))
+            if len(bindings) > 1:
+                return self._integrity_alert(db, identity, None, correlation)
+            if bindings:
+                subject = db.scalar(select(Subject).where(Subject.id == bindings[0].subject_id).with_for_update())
+                self._subject(db, identity, subject.id, "source_sync", "mutation", correlation)
             else:
-                if record.event_type == 'offer_updated':
-                    raise HTTPException(422, 'UNBOUND_SUBJECT')
+                if record.event_type == "offer_updated":
+                    raise HTTPException(422, "UNBOUND_SUBJECT")
                 subject = Subject(tenant_id=identity.tenant_id)
                 db.add(subject); db.flush()
                 subject.wrapped_key, subject.key_reference = self.keys.wrap(subject.id, os.urandom(32))
                 db.add(SubjectBinding(subject_id=subject.id, tenant_id=identity.tenant_id,
-                    source_system='ATS', source_person_ref=record.source_person_ref,
-                    authenticated_account_id=record.authenticated_account_id))
-            # Prevent an offer identity from being silently moved to another person.
+                    source_system=snapshot["source_system_id"], source_person_ref=record.source_person_ref,
+                    authenticated_account_id=None))
+            # One offer identity may never map to a second subject (D9).
             other = db.scalar(select(Claim.id).where(Claim.tenant_id == identity.tenant_id,
-                Claim.source_system == 'ATS', Claim.source_record_id == record.source_record_id,
-                Claim.subject_id != subject.id))
+                Claim.source_system == snapshot["source_system_id"],
+                Claim.source_record_id == record.source_record_id, Claim.subject_id != subject.id))
             if other:
-                raise HTTPException(422, 'SOURCE_RECORD_BINDING_MISMATCH')
-            batch_key = 'f08-record:' + record_key
+                return self._integrity_alert(db, identity, subject.id, correlation)
+            batch_key = "f08-record:" + keys.idempotency_key
             receipt = db.scalar(select(MutationReceipt).where(
                 MutationReceipt.tenant_id == identity.tenant_id, MutationReceipt.idempotency_key == batch_key))
             if receipt:
-                return {**receipt.response_json, 'duplicate': True}
-            # Evidence is the exact canonical subject record; no shared plaintext
-            # file is retained. The same bytes/key can serve all three claims.
-            content = canonical(record.model_dump(mode='json'))
+                return {**receipt.response_json, "duplicate": True}
+            superseded = list(db.scalars(select(Claim.id).where(
+                Claim.subject_id == subject.id, Claim.source_system == snapshot["source_system_id"],
+                Claim.predicate.in_([p for p, _ in mapped]), Claim.status.in_(["current", "contested"]),
+                Claim.source_version < record.source_version)))
+            # Per-record snapshot under the subject key; every mapped claim references it.
+            content = canonical(snapshot)
+            evidence_id = sha256((keys.idempotency_key + ":snapshot").encode())[:36]
+            key = self.keys.unwrap(subject.id, subject.wrapped_key, subject.key_reference)
+            evidence_uri = self.evidence.put(identity.tenant_id, subject.id, evidence_id, content, key)
             results = []
-            for predicate, value in [('offer_status', record.offer_status),
-                                     ('offered_role', record.role_ref),
-                                     ('start_date', record.start_date.isoformat())]:
-                evidence_id = sha256((record_key + predicate).encode())[:36]
-                body = ClaimMutation(idempotency_key=batch_key + ':' + predicate,
-                    predicate=predicate, value=value, claim_class='authoritative', record_kind='canonical_claim',
-                    source={'system':'ATS', 'record_id':record.source_record_id, 'authority':'authoritative',
-                            'version':record.source_version},
-                    evidence={'evidence_id':evidence_id, 'hash':sha256(content),
-                              'content_base64':base64.b64encode(content).decode()},
-                    purpose_id='source_sync', valid_from=record.effective_from,
-                    observed_at=record.source_updated_at, retention_rule='preboarding_source_evidence',
-                    confidence_band='confirmed')
-                results.append(self._mutate(db, identity, subject.id, body, correlation, commit=False))
-            result = {'subject_id':subject.id, 'claims':results, 'duplicate':False}
+            for predicate, value in mapped:
+                body = ClaimMutation(idempotency_key=batch_key + ":" + predicate,
+                    predicate=predicate, value=value, claim_class="authoritative", record_kind="canonical_claim",
+                    source={"system": snapshot["source_system_id"], "record_id": record.source_record_id,
+                            "authority": "authoritative", "version": record.source_version},
+                    evidence={"evidence_id": evidence_id, "hash": sha256(content),
+                              "content_base64": base64.b64encode(content).decode()},
+                    purpose_id="source_sync", valid_from=record.effective_from,
+                    observed_at=record.source_updated_at, retention_rule=self.IMPORT_SNAPSHOT_RETENTION,
+                    confidence_band="confirmed")
+                results.append(self._mutate(db, identity, subject.id, body, correlation,
+                                            commit=False, stored_evidence_uri=evidence_uri))
+            if file_evidence_id and not db.get(ImportFileEvidenceSubject, (file_evidence_id, subject.id)):
+                db.add(ImportFileEvidenceSubject(file_evidence_id=file_evidence_id, subject_id=subject.id))
+            result = {"subject_id": subject.id, "claims": results, "superseded_claim_ids": superseded,
+                      "snapshot": {"evidence_id": evidence_id, "evidence_hash": sha256(content),
+                                   "evidence_uri": evidence_uri, "file_evidence_id": file_evidence_id},
+                      "duplicate": False}
             db.add(MutationReceipt(tenant_id=identity.tenant_id, idempotency_key=batch_key,
-                                   request_hash=record_key, response_json=result))
+                                   request_hash=keys.idempotency_key, response_json=result))
             db.commit()
             return result
+
+    def _integrity_alert(self, db, identity, subject_id, correlation):
+        db.rollback()
+        self.audit(db, identity, subject_id, "source_sync", "claim_mutation", "integrity_alert", correlation)
+        db.commit()
+        raise HTTPException(422, "BINDING_INTEGRITY_ERROR")
+
+
+class F01ImportContract:
+    """The only F01 surface handed to the F08 adapter (design §1.11).
+
+    It exposes the evidence and atomic record-mutation contracts and nothing else:
+    no session factory, no claim/ledger/evidence writers.
+    """
+    __slots__ = ("_service",)
+
+    def __init__(self, service: ClaimService):
+        self._service = service
+
+    def store_file_evidence(self, *args, **kwargs):
+        return self._service.store_import_file_evidence(*args, **kwargs)
+
+    def submit_record(self, *args, **kwargs):
+        return self._service.submit_import_record(*args, **kwargs)

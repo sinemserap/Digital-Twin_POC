@@ -25,7 +25,8 @@ class SubjectBinding(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=uuid_str)
     subject_id: Mapped[str] = mapped_column(ForeignKey("subject.id"), index=True)
     tenant_id: Mapped[str] = mapped_column(String(128), index=True)
-    authenticated_account_id: Mapped[str] = mapped_column(String(128), index=True)
+    # Null for subjects created by a source import; the account is bound later via /subjects.
+    authenticated_account_id: Mapped[str | None] = mapped_column(String(128), index=True)
     source_system: Mapped[str] = mapped_column(String(128))
     source_person_ref: Mapped[str] = mapped_column(String(256))
 
@@ -83,6 +84,37 @@ class MutationReceipt(Base):
     claim_id: Mapped[str | None] = mapped_column(String(36))
     response_json: Mapped[dict | None] = mapped_column(JSON)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ImportFileEvidence(Base):
+    """F01-owned file-level import evidence (F08 design §1.8).
+
+    The accepted original multi-subject file is encrypted under its own file key and
+    linked to a manifest of file hash plus record hashes/positions. Destroying the key
+    (subject erasure or file-retention end) makes the raw file unrecoverable while the
+    manifest remains as non-decryptable accountability metadata.
+    """
+    __tablename__ = "import_file_evidence"
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)  # file identity hash
+    tenant_id: Mapped[str] = mapped_column(String(128), index=True)
+    source_system_id: Mapped[str] = mapped_column(String(128))
+    snapshot_id: Mapped[str] = mapped_column(String(128))
+    file_hash: Mapped[str] = mapped_column(String(64))
+    wrapped_key: Mapped[bytes | None] = mapped_column(LargeBinary)
+    key_reference: Mapped[str | None] = mapped_column(String(512))
+    evidence_uri: Mapped[str] = mapped_column(String(1024))
+    manifest: Mapped[dict] = mapped_column(JSON)
+    retention_rule: Mapped[str] = mapped_column(String(128))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    key_destroyed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    key_destroyed_reason: Mapped[str | None] = mapped_column(String(40))
+
+
+class ImportFileEvidenceSubject(Base):
+    """Which subjects a shared import file contains, so erasure can destroy the file key."""
+    __tablename__ = "import_file_evidence_subject"
+    file_evidence_id: Mapped[str] = mapped_column(ForeignKey("import_file_evidence.id"), primary_key=True)
+    subject_id: Mapped[str] = mapped_column(ForeignKey("subject.id"), primary_key=True)
 
 
 class PredicateRegistry(Base):

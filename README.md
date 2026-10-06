@@ -123,80 +123,145 @@ Tests set the current flag or clear the wrapped key/key reference directly as co
 Acceptance coverage includes late corrections, both timestamp cutoffs, inclusive/exclusive validity boundaries, timezone offsets, older late arrivals, same-version and different-source conflicts, evidence references, access isolation, audit records, current rights and post-erasure restart. Run `pytest` for this coverage and the original Part 1 checks.
 
 
-## F08 bounded controlled source import
+## F08 controlled source import (US40858 Part 1)
 
-Built against PR #1 commit `ad339091` and the Drive `EDT_v3-1_Features.xlsx`
-F08 acceptance criteria (23 October). Reuses the existing final F08 decisions:
-JSONL v1, ATS authority limited to `offer_status`, `offered_role` (from `role_ref`),
-`start_date`, monotonic source versions and delta/upsert semantics. Absence from
-an import never deletes a fact or completes a task.
+Implements the updated F08 design document (US40858_EDT_F08_Controlled_Source_Import_Part_1)
+against the F01 Part 1 contract: one synthetic ATS-like source, JSON Lines schema v1,
+file upload only, delta/upsert semantics (absence from a file never changes a fact),
+mandatory monotonic `source_version`, atomic multi-claim submission through F01 and no
+withdrawal cascade. The PoC decisions D1–D11 of the design are adopted as written.
 
-Upload `fixtures/offer-update-v1.jsonl` to `POST /imports/ATS` with
-`Content-Type: application/x-ndjson` and the mocked identity headers using
-`X-Roles: data_administrator`. `fixtures/offer-update-v1.schema.json` describes
-both the first-line header and remaining offer/update records. The required
-`authenticated_account_id` is a synthetic binding assertion: it creates the
-first offer's binding and must match that binding thereafter; it is never a
-fuzzy match or account-rebinding request. The only source is the fixed ATS
-fixture. Deployment must replace mocked trusted headers with authenticated JWTs.
+### File contract (schema v1)
 
-File limits are 256 KiB and 100 records. The gate rejects malformed UTF-8/JSON,
-duplicate JSON keys, unknown fields/source/schema, foreign header tenant,
-wrong count/hash and future generation time before any canonical mutation.
-`content_hash` is SHA-256 of the exact record lines joined with LF and one
-trailing LF; exclude the header. No optional signature contract is enabled.
+`fixtures/offer-update-v1.schema.json` is generated from `app/import_schema.py` and a
+test keeps both in sync. The first JSONL line is the header
+(`schema_version`, `source_system_id`, `tenant_id`, `snapshot_id`, `generated_at`,
+`record_count`, `content_hash`, optional `signature`); every other line is one record
+(`tenant_id`, `source_record_id`, `source_person_ref`, `source_version`,
+`source_updated_at`, `event_type`, `role_ref`, `start_date`, `offer_status`,
+`effective_from`). `content_hash` is SHA-256 of the exact record lines joined with LF plus
+one trailing LF, header excluded. `signature` is HMAC-SHA256 of `content_hash` with the
+source's signing secret and is required and verified only when the source registry has
+a secret (`IMPORT_SIGNING_SECRET_ATS` or the `source_registry` argument of `create_app`).
+CSV is not supported. `event_type` is `offer_accepted` or `offer_updated`.
 
-Each complete record is validated before F01 submission. Invalid records,
-foreign tenants, account/offer identity mismatches and restricted/erased
-subjects produce **quarantined operational outcomes**; no raw record is persisted
-in quarantine. Reports contain positions, hashes, reason codes and F01 references,
-never offer values. `offer_updated` with no binding is held without creating a
-subject. Fix held/quarantined inputs and submit a new snapshot; a completed
-file remains an immutable reported attempt. Valid neighboring records continue.
-This operational quarantine is separate from F01 model-output hypotheses.
+`app/source_registry.py` is the registry entry: the ATS source may assert
+`offer_status`, `offered_role` (from `role_ref`) and `start_date` only. `work_location`,
+`manager_ref` or any other field rejects the entire record as `NOT_AUTHORITATIVE`; F08
+does not widen ATS authority. Subject binding is deterministic through
+`source_person_ref`; schema v1 carries no account field. A subject created by an import
+has no candidate account until `/subjects` asserts one for the same
+`source_person_ref` (first assertion binds; until then candidate self-view returns 404).
 
-`ClaimService.import_offer` is the transactional F01 record entry point. It
-resolves/creates the subject binding and uses the existing claim mutation logic
-for all three mapped facts inside one database transaction, with one batch
-receipt. A failure rolls back the entire subject/claim/ledger/receipt set.
-Source version/effective/observed time map to F01 unchanged; ingestion time is
-server-generated. Higher versions supersede; lower unseen versions remain
-historical; conflicting same-version values are contested. `accepted` in the
-run report includes successful higher versions; F01 result references retain
-per-claim statuses. History remains available through the F01 historical endpoint.
+### Processing flow
 
-The adapter owns only `import_run` operational state. Exact completed files
-short-circuit; incomplete runs resume from durable outcomes. F01 record receipts
-prevent duplication when a crash follows canonical commit but precedes reporting.
-Identical records in different files reuse F01 references. PostgreSQL session
-advisory locks serialize this one source per tenant across adapter instances;
-SQLite demo mode requires a single service process and uses a thread lock.
-No live ATS connectivity, polling, workflow state or broad reconciliation exists.
+Upload with `POST /imports/ATS`, `Content-Type: application/x-ndjson` and the mocked
+identity headers using `X-Roles: data_administrator` (a candidate role is refused). The
+import-context tenant comes from the identity, never from the body. Limits are 256 KiB
+and 100 records; the optional malware scanner hook (`malware_scanner` argument of
+`create_app`) runs before parsing and the PoC default performs no scan.
 
-`GET /imports/ATS/freshness` requires the administrator role and returns
-`missing`, `fresh` or `stale`, last successful source generation time, age and
-the configured seven-day threshold. Failed/all-invalid files never advance
-freshness; an exact file replay never refreshes its timestamp. Status is isolated
-by identity tenant and always exposes `task_completion=unknown`. This is an
-operator API, not a candidate/task UI or a change to `/twin`'s `stale` field.
+1. **File gate**, in design order, each rejecting the whole file with HTTP 422 and an
+   `ImportFileRejected` event carrying only the file hash: `FILE_SIZE_INVALID`,
+   `FILE_REJECTED_MALWARE`, `FILE_STRUCTURE_INVALID` (malformed UTF-8/JSON, duplicate
+   keys, unknown header fields), `SOURCE_NOT_REGISTERED`, `FILE_TENANT_MISMATCH`,
+   `SCHEMA_VERSION_UNSUPPORTED`, `FILE_INTEGRITY_FAILED` (record count, content hash,
+   configured signature, future `generated_at`). No run, evidence or claim state exists
+   after a gate rejection.
+2. **Evidence** (§1.8): the accepted original file is stored through F01 as file-level
+   evidence encrypted under its own file key, with a manifest of file hash, upload hash and
+   per-position record hashes (`import_file_evidence`). Every accepted record becomes one
+   canonical per-record snapshot (canonical record, file hash, snapshot id, source record
+   id/version, record hash, line position) stored under the subject key; all mapped claims
+   of the record reference that snapshot, never the shared raw file.
+3. **Per record** (§1.3): the whole record is validated, record identity and idempotency
+   keys are computed, the decision table is applied and the mapped claim set is submitted
+   to `ClaimService.submit_import_record`, which resolves/creates the binding, writes the
+   snapshot and commits all three claims in one transaction. A failure of any mapped claim
+   rolls back the subject, binding, snapshot reference, claims, ledger entries and receipts
+   of that record; neighbouring records continue.
+4. **Outcome persistence** (§1.9): `import_run` (keyed by tenant + source + snapshot +
+   content hash with status, attempt count and timestamps), `import_record_outcome` (one
+   durable row per position with identity/idempotency keys, outcome, reason code and F01
+   references), `import_attempt` (user, correlation id, outcome per upload) and
+   `import_event` (`ImportFileRejected`, `ImportRecordHeld`, `BindingIntegrityAlert`).
 
-### Evidence and remaining fuller-design dependencies
+### Decision table and report
 
-F01 encrypts canonical record snapshots under the subject key and each claim
-references its evidence. Neither F08 metadata nor quarantine stores personal
-payloads. This smallest slice **does not implement the fuller final F08 document's
-shared raw-file evidence key/manifest lifecycle**, malware scanning, optional
-file signatures, or full F02/F07 retention/deletion orchestration. Raw uploads
-are transient and not retained. A rolled-back database transaction can leave
-an encrypted unreferenced object in the evidence adapter; production object
-cleanup/recovery remains an F01/F02 storage concern. Current subject restriction
-and erasure gates prevent new import processing from restoring erased data.
+Record outcomes are mutually exclusive: `accepted` (`ACCEPTED`, or `FUTURE_VALID` when
+`effective_from` is in the future; such a claim is stored but `/twin` reports
+`not_yet_valid` until the valid time), `superseded` (`SUPERSEDED`: higher version
+supersedes the current same-source claims), `historical` (`LATE_HISTORICAL`: lower unseen
+version stored with its own valid time, current state unchanged), `duplicate`
+(`DUPLICATE`: exact idempotency key already processed, original F01 references returned,
+no F01 call), `contested` (`VERSION_CONFLICT`: same record identity with different
+canonical content; value-conflicting claims are contested in F01 and no conflicting value
+is usable as current), `held_for_review` (`UNBOUND_SUBJECT`: `offer_updated` without a
+binding; only run metadata, an evidence reference to the file-level evidence and
+`retention_rule=import_hold_short_review` are stored, no subject or claim) and `rejected`
+(`WRONG_TENANT`, `INVALID_RECORD`, `NOT_AUTHORITATIVE`, `BINDING_INTEGRITY_ERROR` with an
+integrity alert when an offer identity would map to a second subject, plus the F01 gates
+`RESTRICTED`, `ERASED` and `IDEMPOTENCY_CONFLICT`). Quarantine is not used by F08.
 
-Apply `migrations/003_controlled_import.sql` after 001/002 when upgrading
-PostgreSQL. It adds only F08 operational metadata. Fresh local startup creates
-the table. The opt-in PostgreSQL tests now apply all three actual migrations.
-`python -m pytest` covers original F01 behavior plus bounded F08 file gates,
-quarantine/hold, identity checks, evidence, atomic rollback, duplicate replay,
-late/change/conflict handling, crash/resume, concurrent imports, restart,
-restriction/erasure and missing/stale-source status. No cloud deployment is
-claimed by this implementation.
+Record identity is `tenant_id + source_system_id + source_record_id + source_version`;
+the exact-record idempotency key is SHA-256 of that identity plus the canonical content
+hash. `source_version` is the only ordering key; `source_updated_at` maps to
+`observed_at`, `effective_from` to `valid_from`, and ingestion time is server generated.
+
+The run report returns run fields (`run_id`, `source_system_id`, `tenant_id`,
+`snapshot_id`, `file_hash`, `started_at`, `completed_at`, `status`, `total_records`,
+`attempt_count`, `file_evidence_id`), `counts` for the seven outcomes and per-record
+outcomes with position, record hash, source record id/version, reason code and F01
+references (subject id, claim ids/statuses, ledger sequence/hash, snapshot evidence id).
+Reports, events and errors never contain candidate field values.
+
+### Idempotency, resume and concurrency
+
+A completed exact file re-import is logged as another attempt and returns the stored
+report with `duplicate_file=true`; no record is resubmitted to F01. An incomplete run
+(for example a crash after an F01 commit but before the F08 outcome was written) resumes
+the same `import_run`: positions with a durable outcome are skipped and a record whose F01
+receipt already exists reuses that result and reports as a clean acceptance. Parallel
+imports of the same file are serialized per tenant and source by a PostgreSQL session
+advisory lock (SQLite demo mode: one process, thread lock) and converge on one run.
+
+### Erasure and retention
+
+File-level evidence uses `retention_rule=preboarding_source_evidence_file`; subject
+snapshots inherit the claim/evidence rule; held records use `import_hold_short_review`.
+Part 1 stores the rule only. `ClaimService.crypto_shred_subject` is the erasure hook for
+F02: it destroys the subject key and the key of every shared import file containing that
+subject, so the raw multi-subject file is no longer recoverable while other subjects keep
+their own subject-key snapshots and the manifest remains as accountability metadata.
+`destroy_import_file_key` is the retention-end hook for F07. No scheduler is added.
+
+### Write boundary
+
+The adapter is constructed with `F01ImportContract`, which exposes only
+`store_file_evidence` and `submit_record`, and with a session factory that refuses to
+flush any table other than the four F08 operational tables. Migration 003 documents the
+matching database-role grants for deployment. `GET /imports/ATS/freshness` is retained
+from the earlier acceptance criteria as an operator API outside the §1.12 boundary.
+
+### Migrations and tests
+
+Apply `migrations/003_controlled_import.sql` after 001/002. It replaces the earlier,
+never-merged draft of 003: it makes `subject_binding.authenticated_account_id` nullable,
+adds the F01 file-evidence tables and the four F08 operational tables. Fresh local
+startup creates them; the opt-in PostgreSQL tests apply all three actual migrations.
+
+`tests/test_import.py` implements design scenarios T01–T20 by name (clean import, file
+and record duplicates, higher/late/conflicting versions, tenant/source/schema/integrity
+gates including a configured signature, unbound hold with `ImportRecordHeld`, mixed
+files, non-authoritative fields, atomic record failure, crash/resume, parallel imports,
+direct-write denial, file/subject evidence linkage with erasure, and the report over
+`fixtures/offer-update-v1-mixed.jsonl`) plus future valid time, binding integrity alerts,
+account binding after import, restricted/erased subjects and restart. Run `python -m
+pytest` for SQLite and add `--postgres-url` for the migrated PostgreSQL run.
+
+Local validation on 6 October 2026: SQLite **78 passed** (five PostgreSQL-only cases
+skipped); migrated PostgreSQL 16 **83 passed** in both UTC and America/New_York sessions.
+Not covered by this slice: Azure Blob/Key Vault execution, a real malware scanner, F02/F07
+orchestration of the retention and erasure hooks, API/event adapters, offer withdrawal
+and the ledger event names `ClaimSuperseded`/`ClaimContested` (F01 records supersession
+and contest through claim status and ledger metadata).

@@ -6,3 +6,4 @@ __pycache__/
 .evidence/
 .env
 
+*.egg-info/

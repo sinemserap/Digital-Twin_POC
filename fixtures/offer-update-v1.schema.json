@@ -1,27 +1,11 @@
 {
   "header": {
     "additionalProperties": false,
+    "description": "First JSONL line: the file gate.",
     "properties": {
-      "schema_version": {
-        "const": "1",
-        "title": "Schema Version",
-        "type": "string"
-      },
-      "source_system_id": {
-        "const": "ATS",
-        "title": "Source System Id",
-        "type": "string"
-      },
-      "tenant_id": {
-        "maxLength": 128,
-        "minLength": 1,
-        "title": "Tenant Id",
-        "type": "string"
-      },
-      "snapshot_id": {
-        "maxLength": 128,
-        "minLength": 1,
-        "title": "Snapshot Id",
+      "content_hash": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Content Hash",
         "type": "string"
       },
       "generated_at": {
@@ -35,9 +19,40 @@
         "title": "Record Count",
         "type": "integer"
       },
-      "content_hash": {
-        "pattern": "^[0-9a-f]{64}$",
-        "title": "Content Hash",
+      "schema_version": {
+        "const": "1",
+        "title": "Schema Version",
+        "type": "string"
+      },
+      "signature": {
+        "anyOf": [
+          {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Signature"
+      },
+      "snapshot_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Snapshot Id",
+        "type": "string"
+      },
+      "source_system_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Source System Id",
+        "type": "string"
+      },
+      "tenant_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Tenant Id",
         "type": "string"
       }
     },
@@ -55,40 +70,11 @@
   },
   "record": {
     "additionalProperties": false,
+    "description": "One offer/update record. Subject binding is deterministic through source_person_ref.",
     "properties": {
-      "tenant_id": {
-        "maxLength": 128,
-        "minLength": 1,
-        "title": "Tenant Id",
-        "type": "string"
-      },
-      "source_record_id": {
-        "maxLength": 256,
-        "minLength": 1,
-        "title": "Source Record Id",
-        "type": "string"
-      },
-      "source_person_ref": {
-        "maxLength": 256,
-        "minLength": 1,
-        "title": "Source Person Ref",
-        "type": "string"
-      },
-      "authenticated_account_id": {
-        "maxLength": 128,
-        "minLength": 1,
-        "title": "Authenticated Account Id",
-        "type": "string"
-      },
-      "source_version": {
-        "maximum": 2147483647,
-        "minimum": 1,
-        "title": "Source Version",
-        "type": "integer"
-      },
-      "source_updated_at": {
+      "effective_from": {
         "format": "date-time",
-        "title": "Source Updated At",
+        "title": "Effective From",
         "type": "string"
       },
       "event_type": {
@@ -99,25 +85,49 @@
         "title": "Event Type",
         "type": "string"
       },
+      "offer_status": {
+        "const": "accepted",
+        "title": "Offer Status",
+        "type": "string"
+      },
       "role_ref": {
         "maxLength": 256,
         "minLength": 1,
         "title": "Role Ref",
         "type": "string"
       },
+      "source_person_ref": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Source Person Ref",
+        "type": "string"
+      },
+      "source_record_id": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Source Record Id",
+        "type": "string"
+      },
+      "source_updated_at": {
+        "format": "date-time",
+        "title": "Source Updated At",
+        "type": "string"
+      },
+      "source_version": {
+        "maximum": 2147483647,
+        "minimum": 1,
+        "title": "Source Version",
+        "type": "integer"
+      },
       "start_date": {
         "format": "date",
         "title": "Start Date",
         "type": "string"
       },
-      "offer_status": {
-        "const": "accepted",
-        "title": "Offer Status",
-        "type": "string"
-      },
-      "effective_from": {
-        "format": "date-time",
-        "title": "Effective From",
+      "tenant_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Tenant Id",
         "type": "string"
       }
     },
@@ -125,7 +135,6 @@
       "tenant_id",
       "source_record_id",
       "source_person_ref",
-      "authenticated_account_id",
       "source_version",
       "source_updated_at",
       "event_type",
