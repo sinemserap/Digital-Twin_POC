@@ -235,13 +235,51 @@ subject, so the raw multi-subject file is no longer recoverable while other subj
 their own subject-key snapshots and the manifest remains as accountability metadata.
 `destroy_import_file_key` is the retention-end hook for F07. No scheduler is added.
 
-### Write boundary
+### Canonical events (AC8)
+
+F01 appends the named canonical events to the subject's hash-chained ledger
+(`event_ledger.event_type`): `EvidenceAcquired` when an evidence object is stored (once
+per per-record snapshot on the import path), then exactly one of `ClaimAccepted`
+(current or historical) or `ClaimProposed` (recorded but contested, so not accepted as
+current) per claim, followed by `ClaimSuperseded` for every same-source claim the new
+version supersedes and `ClaimContested` for every claim involved in a same-version or
+cross-source value conflict. Each claim's `event_sequence`/`record_hash` points at its
+own ClaimAccepted/ClaimProposed entry; status-change events reference the affected claim
+and the claim that caused the change. `verify_ledger` covers all event kinds. F08 emits
+`ImportFileRejected`, `ImportRecordHeld` and `BindingIntegrityAlert` in its own
+`import_event` table.
+
+**Conflict reading (AC7):** for a same-source, same-version record with different
+content, only the predicates whose values differ are contested (both the earlier and the
+new claim); identical values in the same record are accepted as historical. The record
+outcome is `contested` / `VERSION_CONFLICT` either way. T06 and T20 pin this reading; if
+"both records contested" is meant to contest every claim of both records, that is a
+one-line change in F01's conflict branch to be agreed with the product owner.
+
+### Write boundary (AC8)
 
 The adapter is constructed with `F01ImportContract`, which exposes only
-`store_file_evidence` and `submit_record`, and with a session factory that refuses to
-flush any table other than the four F08 operational tables. Migration 003 documents the
-matching database-role grants for deployment. `GET /imports/ATS/freshness` is retained
-from the earlier acceptance criteria as an operator API outside the §1.12 boundary.
+`store_file_evidence` and `submit_record`, and, when `IMPORT_DATABASE_URL` (or the
+`import_database_url` argument of `create_app`) is set, with its own database engine and
+login role. `migrations/f08_adapter_role.sql` holds the grants for that role: usage on
+the schema and select/insert/update on the four F08 tables only, nothing on subject,
+binding, claim, ledger, receipt, audit or file-evidence tables. The PostgreSQL-only test
+`test_f08_adapter_role_cannot_write_canonical_state` creates a disposable role, applies
+that file, runs a complete import through the app with the adapter on the restricted
+role, and asserts that raw SQL on that connection is denied by PostgreSQL for claim,
+subject, event_ledger, mutation_receipt, import_file_evidence and audit_log while
+import tables remain writable. In-process, the adapter's session factory additionally
+refuses to flush any non-F08 table (defence in depth, and the only guard in the SQLite
+demo, which shares one file database). Known limitation: without `IMPORT_DATABASE_URL`
+the adapter shares the F01 engine and credentials.
+
+### Outside this story: source freshness (early work for US41282)
+
+`GET /imports/ATS/freshness` (data-administrator role) returns `missing`, `fresh` or
+`stale` from completed runs with at least one canonical outcome, with a seven-day
+threshold and `task_completion=unknown`. Stale/missing-source visibility belongs to
+US41282 (design D2), so this endpoint is not evidence for US40858; it is kept as early
+US41282 work and is covered by two tests only.
 
 ### Migrations and tests
 
@@ -255,13 +293,13 @@ and record duplicates, higher/late/conflicting versions, tenant/source/schema/in
 gates including a configured signature, unbound hold with `ImportRecordHeld`, mixed
 files, non-authoritative fields, atomic record failure, crash/resume, parallel imports,
 direct-write denial, file/subject evidence linkage with erasure, and the report over
-`fixtures/offer-update-v1-mixed.jsonl`) plus future valid time, binding integrity alerts,
-account binding after import, restricted/erased subjects and restart. Run `python -m
-pytest` for SQLite and add `--postgres-url` for the migrated PostgreSQL run.
+`fixtures/offer-update-v1-mixed.jsonl`) plus canonical event sequences, future valid
+time, binding integrity alerts, account binding after import, restricted/erased subjects
+and restart. Run `python -m pytest` for SQLite and add `--postgres-url` for the migrated
+PostgreSQL run, which adds the restricted-role boundary test.
 
-Local validation on 6 October 2026: SQLite **78 passed** (five PostgreSQL-only cases
-skipped); migrated PostgreSQL 16 **83 passed** in both UTC and America/New_York sessions.
-Not covered by this slice: Azure Blob/Key Vault execution, a real malware scanner, F02/F07
-orchestration of the retention and erasure hooks, API/event adapters, offer withdrawal
-and the ledger event names `ClaimSuperseded`/`ClaimContested` (F01 records supersession
-and contest through claim status and ledger metadata).
+Local validation on 7 October 2026: SQLite **78 passed** (six PostgreSQL-only cases
+skipped); migrated PostgreSQL 16 **84 passed** in both UTC and America/New_York sessions.
+The same PostgreSQL workflow runs on every pull request. Not covered by this slice: Azure
+Blob/Key Vault execution, a real malware scanner, F02/F07 orchestration of the retention
+and erasure hooks, API/event adapters and offer withdrawal.

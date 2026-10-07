@@ -1,14 +1,16 @@
 """PostgreSQL-only cases supplementing the shared acceptance suite."""
+import uuid
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine, event, func, inspect, select, text
+from sqlalchemy.engine import make_url
 
 from app.main import create_app
 from app.models import Claim, EventLedger, MutationReceipt, Subject, SubjectBinding
-from conftest import apply_migration
+from conftest import MIGRATIONS, apply_migration
 from test_acceptance import accept, acceptance_clock, headers, history, import_subject, mutation
 
 
@@ -55,7 +57,7 @@ def test_migration_002_preserves_populated_part1_and_enforces_current_rights(
         assert accept(client, sid, mutation()) == result
         assert history(client, sid).json()["predicates"]["start_date"]["value"] == "2026-11-01"
         with upgraded.state.sessions() as db:
-            assert db.scalar(select(func.count()).select_from(EventLedger)) == 1
+            assert db.scalar(select(func.count()).select_from(EventLedger)) == 2
             assert upgraded.state.service.verify_ledger(db, sid)
             db.get(Subject, sid).restricted = True
             db.commit()
@@ -129,8 +131,8 @@ def test_concurrent_receipt_unique_constraint(pg_env, changed):
     if not changed:
         assert responses[0].json() == responses[1].json()
     with app.state.sessions() as db:
-        for model in (Claim, EventLedger, MutationReceipt):
-            assert db.scalar(select(func.count()).select_from(model)) == 1
+        for model, expected in ((Claim, 1), (EventLedger, 2), (MutationReceipt, 1)):
+            assert db.scalar(select(func.count()).select_from(model)) == expected
         assert app.state.service.verify_ledger(db, sid)
         receipt = db.scalar(select(MutationReceipt))
         assert receipt.response_json == next(r.json() for r in responses if r.status_code == 201)
@@ -156,3 +158,66 @@ def test_concurrent_subject_import_rolls_back_losing_subject(pg_env):
     with app.state.sessions() as db:
         assert db.scalar(select(func.count()).select_from(Subject)) == 1
         assert db.scalar(select(func.count()).select_from(SubjectBinding)) == 1
+
+
+def test_f08_adapter_role_cannot_write_canonical_state(postgres_database, tmp_path):
+    """Design §1.11: the adapter's runtime identity holds no write permission on canonical state."""
+    import secrets
+    from sqlalchemy.exc import ProgrammingError
+    from test_import import counts, file, upload
+    url = make_url(postgres_database)
+    role, password = "edt_f08_" + uuid.uuid4().hex[:12], secrets.token_urlsafe(16)
+    owner = create_engine(postgres_database)
+    try:
+        with owner.begin() as conn:
+            try:
+                # DDL takes no bind parameters; token_urlsafe yields only [A-Za-z0-9_-].
+                conn.execute(text(f"CREATE ROLE \"{role}\" LOGIN PASSWORD '{password}'"))
+            except ProgrammingError as exc:
+                if getattr(exc.orig, "sqlstate", None) != "42501":
+                    raise
+                pytest.skip("test user lacks CREATEROLE")
+            schema = conn.execute(text("SELECT current_schema()")).scalar_one()
+            grants = (MIGRATIONS / "f08_adapter_role.sql").read_text().replace("edt_f08", role).replace("public", schema)
+            conn.exec_driver_sql(grants)
+    except Exception:
+        owner.dispose(); raise
+    restricted_url = url.set(username=role, password=password).render_as_string(hide_password=False)
+    try:
+        app = create_app(postgres_database, str(tmp_path / "evidence"), import_database_url=restricted_url)
+        with TestClient(app) as client:
+            assert app.state.import_engine is not app.state.engine
+            assert app.state.importer.engine.url.username == role
+            # A full import works: the adapter writes its own tables and everything else goes through F01.
+            report = upload(client, file()).json()
+            assert [o["outcome"] for o in report["outcomes"]] == ["accepted"] and counts(app) == [1, 3, 4]
+            assert client.get("/imports/ATS/freshness", headers=headers(roles="data_administrator")).json()["state"] == "fresh"
+            sid = report["outcomes"][0]["f01"]["subject_id"]
+            # Raw SQL as the adapter identity, bypassing the in-process ORM guard: PostgreSQL denies it.
+            denied = [
+                f"UPDATE claim SET status = 'superseded' WHERE subject_id = '{sid}'",
+                f"UPDATE subject SET restricted = true WHERE id = '{sid}'",
+                f"INSERT INTO event_ledger (id, tenant_id, subject_id, claim_id, sequence, event_type, ciphertext, "
+                f"metadata_json, previous_hash, record_hash, created_at) SELECT 'x', tenant_id, subject_id, claim_id, 99, "
+                f"'ClaimAccepted', ciphertext, metadata_json, previous_hash, record_hash, created_at FROM event_ledger LIMIT 1",
+                "DELETE FROM mutation_receipt",
+                "UPDATE import_file_evidence SET wrapped_key = NULL",
+                "SELECT count(*) FROM claim",
+                "SELECT count(*) FROM audit_log",
+            ]
+            for statement in denied:
+                with app.state.import_engine.connect() as conn:
+                    with pytest.raises(ProgrammingError, match="permission denied"):
+                        conn.execute(text(statement))
+            with app.state.import_engine.begin() as conn:
+                assert conn.execute(text("SELECT count(*) FROM import_record_outcome")).scalar_one() == 1
+            assert counts(app) == [1, 3, 4]
+            with app.state.sessions() as db:
+                assert app.state.service.verify_ledger(db, sid)
+    finally:
+        with owner.begin() as conn:
+            # Explicit revokes: a CREATEROLE (non-superuser) owner may not DROP OWNED BY on PostgreSQL 16.
+            conn.execute(text(f'REVOKE ALL ON ALL TABLES IN SCHEMA "{schema}" FROM "{role}"'))
+            conn.execute(text(f'REVOKE ALL ON SCHEMA "{schema}" FROM "{role}"'))
+            conn.execute(text(f'DROP ROLE "{role}"'))
+        owner.dispose()

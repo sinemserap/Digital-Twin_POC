@@ -89,7 +89,7 @@ def test_t01_valid_new_offer_atomic_claims_snapshot_and_events(env):
     assert report["status"] == "complete" and report["total_records"] == 1 and report["attempt_count"] == 1
     assert report["counts"] == {"accepted": 1, "superseded": 0, "historical": 0, "duplicate": 0,
                                 "held_for_review": 0, "contested": 0, "rejected": 0}
-    assert outcomes(report) == [("accepted", "ACCEPTED")] and counts(app) == [1, 3, 3]
+    assert outcomes(report) == [("accepted", "ACCEPTED")] and counts(app) == [1, 3, 4]
     o = report["outcomes"][0]
     assert o["source_record_id"] == "offer-1" and o["source_version"] == 1
     assert {c["status"] for c in o["f01"]["claims"]} == {"current"} and len(o["f01"]["claims"]) == 3
@@ -98,6 +98,9 @@ def test_t01_valid_new_offer_atomic_claims_snapshot_and_events(env):
     snapshot = o["f01"]["snapshot"]
     with app.state.sessions() as db:
         assert app.state.service.verify_ledger(db, sid)
+        # Canonical events: one EvidenceAcquired for the shared snapshot, then one ClaimAccepted per claim.
+        assert [e.event_type for e in db.scalars(select(EventLedger).order_by(EventLedger.sequence))] == [
+            "EvidenceAcquired", "ClaimAccepted", "ClaimAccepted", "ClaimAccepted"]
         claims = db.scalars(select(Claim).where(Claim.subject_id == sid)).all()
         assert {c.predicate for c in claims} == {"offer_status", "offered_role", "start_date"}
         # Every mapped claim references the one per-record subject snapshot, not the raw file.
@@ -126,7 +129,7 @@ def test_t02_same_file_twice_short_circuits_without_resubmission(env, monkeypatc
     duplicate = upload(client, raw).json()
     assert duplicate["duplicate_file"] and duplicate["status"] == "complete" and duplicate["attempt_count"] == 2
     assert duplicate["outcomes"] == first["outcomes"] and duplicate["run_id"] == first["run_id"]
-    assert counts(app) == [1, 3, 3] and len(rows(app, MutationReceipt)) == receipts
+    assert counts(app) == [1, 3, 4] and len(rows(app, MutationReceipt)) == receipts
     assert len(rows(app, ImportFileEvidence)) == 1
 
 
@@ -135,7 +138,7 @@ def test_t03_same_record_in_another_file_is_duplicate_with_original_references(e
     first = upload(client, file()).json()["outcomes"][0]
     second = upload(client, file(snapshot_id="another")).json()
     assert outcomes(second) == [("duplicate", "DUPLICATE")]
-    assert second["outcomes"][0]["f01"] == first["f01"] and counts(app) == [1, 3, 3]
+    assert second["outcomes"][0]["f01"] == first["f01"] and counts(app) == [1, 3, 4]
 
 
 # ----- T04-T06: versioning -----
@@ -151,6 +154,8 @@ def test_t04_higher_version_supersedes_and_keeps_history(env):
     with app.state.sessions() as db:
         statuses = sorted(db.scalars(select(Claim.status).where(Claim.subject_id == sid)))
         assert statuses == ["current"] * 3 + ["superseded"] * 3
+        superseded_events = db.scalars(select(EventLedger).where(EventLedger.event_type == "ClaimSuperseded")).all()
+        assert {e.claim_id for e in superseded_events} == {c for c in db.scalars(select(Claim.id).where(Claim.status == "superseded"))}
         assert app.state.service.verify_ledger(db, sid)
     assert history(client, sid, system_at="2099-01-01T00:00:00Z").json()["predicates"]["start_date"]["value"] == "2026-11-08"
 
@@ -178,6 +183,11 @@ def test_t06_same_version_different_content_is_contested(env):
     assert p["conflict_state"] == "unresolved" and len(p["claims"]) == 2
     with app.state.sessions() as db:
         assert app.state.service.verify_ledger(db, sid)
+        events = [e.event_type for e in db.scalars(select(EventLedger).order_by(EventLedger.sequence))]
+        # Only the value-conflicting start_date claims are contested; the identical offer_status and
+        # offered_role claims of the conflicting record are accepted as historical.
+        assert events == ["EvidenceAcquired"] + ["ClaimAccepted"] * 3 + ["EvidenceAcquired", "ClaimAccepted",
+                          "ClaimAccepted", "ClaimProposed", "ClaimContested", "ClaimContested"]
 
 
 # ----- T07-T11: tenant, source and file gates -----
@@ -232,7 +242,7 @@ def test_t11_signature_verified_when_configured(tmp_path):
         assert wrong.status_code == 422 and wrong.json()["detail"] == "FILE_INTEGRITY_FAILED"
         signed = upload(client, file(signature=registration.signature_for(content_hash)))
         assert signed.status_code == 200 and outcomes(signed.json()) == [("accepted", "ACCEPTED")]
-        assert counts(app) == [1, 3, 3]
+        assert counts(app) == [1, 3, 4]
 
 
 def test_malware_scan_hook_rejects_before_parsing(tmp_path):
@@ -274,7 +284,7 @@ def test_t13_one_invalid_record_among_valid_records(env):
     report = upload(client, file([record(), bad, other])).json()
     assert outcomes(report) == [("accepted", "ACCEPTED"), ("rejected", "INVALID_RECORD"), ("accepted", "ACCEPTED")]
     assert report["counts"]["accepted"] == 2 and report["counts"]["rejected"] == 1
-    assert counts(app) == [2, 6, 6]
+    assert counts(app) == [2, 6, 8]
     with app.state.sessions() as db:
         assert db.scalar(select(func.count()).select_from(Claim).where(Claim.source_record_id == "offer-2")) == 0
 
@@ -339,7 +349,7 @@ def test_t16_incomplete_run_resumes_only_unfinished_records(env, monkeypatch):
     raw = file([record(), second], snapshot_id="crash")
     with pytest.raises(RuntimeError):
         upload(client, raw)
-    assert counts(app) == [1, 3, 3]
+    assert counts(app) == [1, 3, 4]
     with app.state.sessions() as db:
         run = db.get(ImportRun, sha256(canonical(["tenant-a", "ATS", "crash", json.loads(raw.split(b"\n")[0])["content_hash"]])))
         assert run.status == "in_progress" and run.completed_at is None
@@ -348,7 +358,7 @@ def test_t16_incomplete_run_resumes_only_unfinished_records(env, monkeypatch):
     # The committed record reuses its F01 receipt and reports as a clean acceptance, not a duplicate.
     assert outcomes(resumed) == [("accepted", "ACCEPTED"), ("accepted", "ACCEPTED")]
     assert resumed["outcomes"][0]["f01"]["subject_id"] == calls[0]
-    assert len(calls) == 3 and counts(app) == [2, 6, 6]
+    assert len(calls) == 3 and counts(app) == [2, 6, 8]
     assert len(rows(app, ImportFileEvidence)) == 1
     with app.state.sessions() as db:
         assert db.scalar(select(func.count()).select_from(MutationReceipt)) == 8
@@ -361,7 +371,7 @@ def test_t17_parallel_imports_of_same_file_converge(env):
         responses = list(pool.map(lambda _: upload(client, raw), range(2)))
     assert all(r.status_code == 200 for r in responses)
     assert sum(r.json()["duplicate_file"] for r in responses) == 1
-    assert counts(app) == [1, 3, 3] and len(rows(app, ImportRun)) == 1
+    assert counts(app) == [1, 3, 4] and len(rows(app, ImportRun)) == 1
 
 
 # ----- T18-T19: write boundary and evidence linkage -----
@@ -387,7 +397,7 @@ def test_t18_adapter_cannot_write_canonical_state_directly(env):
     with importer.sessions() as db:
         with pytest.raises(PermissionError):
             db.get(Claim, claim.id).status = "superseded"; db.flush()
-    assert counts(app) == [1, 3, 3]
+    assert counts(app) == [1, 3, 4]
     with app.state.sessions() as db:
         assert app.state.service.verify_ledger(db, sid)
 
@@ -448,7 +458,7 @@ def test_t20_run_report_counts_over_mixed_fixture(env):
     assert set(report) >= {"run_id", "source_system_id", "tenant_id", "snapshot_id", "file_hash", "started_at",
                            "completed_at", "status", "total_records"}
     assert no_values(json.dumps(report)) and "2026-11-08" not in json.dumps(report)
-    assert counts(app) == [1, 12, 12]
+    assert counts(app) == [1, 12, 21]
     sid = report["outcomes"][0]["f01"]["subject_id"]
     assert twin(client, sid)["start_date"] == {"state": "unknown", "reason": "contested"}
     assert twin(client, sid)["offer_status"]["value"] == "accepted"
@@ -484,7 +494,7 @@ def test_binding_integrity_error_raises_alert(env):
     moved = record(source_person_ref="another-person", source_version=2)
     report = upload(client, file([moved], snapshot_id="moved")).json()
     assert outcomes(report) == [("rejected", "BINDING_INTEGRITY_ERROR")]
-    assert counts(app) == [1, 3, 3] and len(rows(app, SubjectBinding)) == 1
+    assert counts(app) == [1, 3, 4] and len(rows(app, SubjectBinding)) == 1
     assert [(e.event_type, e.reason_code) for e in rows(app, ImportEvent)] == [("BindingIntegrityAlert", "BINDING_INTEGRITY_ERROR")]
     with app.state.sessions() as db:
         assert db.scalar(select(func.count()).select_from(AuditLog).where(AuditLog.outcome == "integrity_alert")) == 1
@@ -502,7 +512,7 @@ def test_account_binding_after_source_import_enables_candidate_view(env):
     allowed = client.get(f"/subjects/{sid}/twin", params={"purpose": "candidate_self_view"},
                          headers=headers(account="candidate-a", roles="candidate"))
     assert allowed.status_code == 200 and allowed.json()["predicates"]["start_date"]["value"] == "2026-11-01"
-    assert counts(app) == [1, 3, 3]
+    assert counts(app) == [1, 3, 4]
 
 
 @pytest.mark.parametrize("rights,reason", [("restricted", "RESTRICTED"), ("erased", "ERASED")])
@@ -517,7 +527,7 @@ def test_restricted_or_erased_subject_import_is_rejected(env, rights, reason):
             app.state.service.crypto_shred_subject(db, sid)
         db.commit()
     report = upload(client, file([record(source_version=2, event_type="offer_updated")], snapshot_id="rights")).json()
-    assert outcomes(report) == [("rejected", reason)] and counts(app) == [1, 3, 3]
+    assert outcomes(report) == [("rejected", reason)] and counts(app) == [1, 3, 4]
 
 
 def test_role_type_size_and_structure(env):
@@ -551,4 +561,4 @@ def test_restart_reuses_completed_run(env):
         result = upload(fresh, raw).json()
         assert result["duplicate_file"] and result["outcomes"] == first["outcomes"]
         assert freshness(fresh)["state"] == "fresh"
-    assert counts(app) == [1, 3, 3]
+    assert counts(app) == [1, 3, 4]

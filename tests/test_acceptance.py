@@ -74,7 +74,8 @@ def test_idempotency_conflict_unknowns_and_audit(env):
     assert twin.json()["predicates"]["manager_or_sponsor"] == {"state": "unknown", "reason": "no_claim"}
     assert len(twin.json()["predicates"]) == 11
     with app.state.sessions() as db:
-        assert db.scalar(select(func.count()).select_from(EventLedger)) == 1
+        # EvidenceAcquired + ClaimAccepted for the one accepted claim; the replay adds nothing.
+        assert db.scalar(select(func.count()).select_from(EventLedger)) == 2
         operations = set(db.scalars(select(AuditLog.operation)))
         assert {"subject_import", "claim_mutation", "twin_read"} <= operations
 
@@ -87,7 +88,7 @@ def test_concurrent_identical_mutation_creates_one_event(env):
         statuses = list(pool.map(send, range(2)))
     assert statuses == [201, 201]
     with app.state.sessions() as db:
-        assert db.scalar(select(func.count()).select_from(EventLedger)) == 1
+        assert db.scalar(select(func.count()).select_from(EventLedger)) == 2
 
 
 @pytest.mark.parametrize("change,expected", [
@@ -131,7 +132,8 @@ def test_supersession_history_and_multisource_contest(env):
     with app.state.sessions() as db:
         claims = list(db.scalars(select(Claim).order_by(Claim.source_version)))
         assert [c.status for c in claims] == ["superseded", "current"]
-        assert db.scalar(select(func.count()).select_from(EventLedger)) == 2
+        assert [e.event_type for e in db.scalars(select(EventLedger).order_by(EventLedger.sequence))] == [
+            "EvidenceAcquired", "ClaimAccepted", "EvidenceAcquired", "ClaimAccepted", "ClaimSuperseded"]
     conflict = mutation("2026-11-15", 1, "mutation-3", "HR")
     assert client.post(f"/subjects/{sid}/claims", headers=headers(), json=conflict).json()["status"] == "contested"
     twin = client.get(f"/subjects/{sid}/twin?purpose=preboarding_support", headers=headers(account="support", roles="support"))
@@ -206,7 +208,7 @@ def test_bitemporal_late_correction_and_current_contract(env, acceptance_clock):
     assert proof["evidence_id"] == "ev-late-correction"
     assert proof["evidence_hash"] == correction["evidence"]["hash"]
     assert proof["evidence_uri"].endswith("/ev-late-correction")
-    assert proof["record_hash"] == second["record_hash"] and proof["event_sequence"] == 2
+    assert proof["record_hash"] == second["record_hash"] and proof["event_sequence"] == 4
     assert proof["ingested_at"] == "2026-10-05T00:00:00+00:00"
     # With later knowledge, the old assertion still covers the earlier valid time.
     earlier_valid = history(client, sid, valid_at="2026-09-14T23:59:59Z").json()
@@ -224,7 +226,7 @@ def test_bitemporal_late_correction_and_current_contract(env, acceptance_clock):
     assert current["predicates"]["manager_or_sponsor"] == {"state": "unknown", "reason": "no_claim"}
     assert accept(client, sid, correction) == second
     with app.state.sessions() as db:
-        assert db.scalar(select(func.count()).select_from(EventLedger)) == 2
+        assert db.scalar(select(func.count()).select_from(EventLedger)) == 5
         assert app.state.service.verify_ledger(db, sid)
         assert [c.status for c in db.scalars(select(Claim).order_by(Claim.event_sequence))] == ["superseded", "current"]
 
@@ -276,7 +278,12 @@ def test_bitemporal_conflicts_retain_both_evidence_and_do_not_leak_future_state(
     assert history(client, sid).json()["predicates"]["start_date"]["conflict_state"] == "none"
     assert history(client, sid, system_at="2026-10-03T00:00:00Z").json()["predicates"]["start_date"] == disputed
     with app.state.sessions() as db:
-        assert db.scalar(select(func.count()).select_from(EventLedger)) == 3
+        # Conflict: ClaimProposed plus ClaimContested for both claims. Agreement supersedes
+        # both same-source ATS claims, or only the HR claim when HR was the conflicting source.
+        events = [e.event_type for e in db.scalars(select(EventLedger).order_by(EventLedger.sequence))]
+        assert events[2:6] == ["EvidenceAcquired", "ClaimProposed", "ClaimContested", "ClaimContested"]
+        assert events.count("ClaimSuperseded") == (2 if conflicting_source == "ATS" else 1)
+        assert len(events) == (10 if conflicting_source == "ATS" else 9)
         assert app.state.service.verify_ledger(db, sid)
 
 

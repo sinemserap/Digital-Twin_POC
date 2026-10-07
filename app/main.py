@@ -18,9 +18,13 @@ from .source_registry import default_registry
 
 
 def create_app(database_url: str | None = None, evidence_dir: str | None = None, key_protector=None,
-               source_registry=None, malware_scanner=None):
+               source_registry=None, malware_scanner=None, import_database_url: str | None = None):
     settings = Settings()
     engine = build_engine(database_url or settings.database_url)
+    # The F08 adapter runs on its own database identity when configured: a role granted
+    # only the F08 operational tables (design §1.11). Without it the demo shares the engine.
+    import_url = import_database_url or (settings.import_database_url if database_url is None else None)
+    import_engine = build_engine(import_url) if import_url else engine
     sessions = build_session_factory(engine)
     evidence = (AzureBlobEvidenceStore(settings.azure_blob_connection_string, settings.azure_blob_container)
                 if settings.azure_blob_connection_string and evidence_dir is None
@@ -45,6 +49,8 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
             db.commit()
         yield
         engine.dispose()
+        if import_engine is not engine:
+            import_engine.dispose()
 
     app = FastAPI(title="Claim and Evidence Service", version="0.1.0", lifespan=lifespan)
     app.state.engine, app.state.sessions, app.state.service = engine, sessions, service
@@ -53,9 +59,9 @@ def create_app(database_url: str | None = None, evidence_dir: str | None = None,
         return x_correlation_id or str(uuid.uuid4())
 
     # The adapter receives only the F01 import contract, never the service or its sessions.
-    importer = ControlledImporter(engine, F01ImportContract(service), source_registry or default_registry(),
+    importer = ControlledImporter(import_engine, F01ImportContract(service), source_registry or default_registry(),
                                   malware_scanner)
-    app.state.importer = importer
+    app.state.importer, app.state.import_engine = importer, import_engine
 
     @app.post('/imports/{source_system_id}')
     async def import_file(source_system_id: str, request: Request, identity=Depends(authenticated_identity),

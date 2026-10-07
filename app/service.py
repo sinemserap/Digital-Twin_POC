@@ -105,9 +105,25 @@ class ClaimService:
         with self.sessions() as db:
             return self._mutate(db, identity, subject_id, body, correlation)
 
-    def _mutate(self, db, identity, subject_id, body, correlation, commit=True, stored_evidence_uri=None):
+    def _append_event(self, db, tenant_id, subject_id, claim_id, event_type, ciphertext, metadata):
+        """Append one hash-chained canonical event (EvidenceAcquired, ClaimProposed,
+        ClaimAccepted, ClaimSuperseded, ClaimContested) to the subject's ledger."""
+        seq = (db.scalar(select(func.max(EventLedger.sequence)).where(EventLedger.subject_id == subject_id)) or 0) + 1
+        previous = db.scalar(select(EventLedger.record_hash).where(EventLedger.subject_id == subject_id)
+                             .order_by(EventLedger.sequence.desc()).limit(1)) or "0" * 64
+        metadata = {**metadata, "event_type": event_type, "event_sequence": seq}
+        record_hash = sha256(ciphertext + canonical(metadata) + previous.encode())
+        db.add(EventLedger(tenant_id=tenant_id, subject_id=subject_id, claim_id=claim_id, sequence=seq,
+                           event_type=event_type, ciphertext=ciphertext, metadata_json=metadata,
+                           previous_hash=previous, record_hash=record_hash))
+        db.flush()
+        return seq, record_hash
+
+    def _mutate(self, db, identity, subject_id, body, correlation, commit=True, stored_evidence_uri=None,
+                emit_evidence_event=True):
         """One claim mutation. stored_evidence_uri lets an atomic record set share one
-        per-record evidence snapshot already written under the subject key."""
+        per-record evidence snapshot already written under the subject key; the first claim
+        of such a set emits the EvidenceAcquired event for the shared snapshot."""
         self.authorize(db, identity, body.purpose_id, "mutation", subject_id, correlation)
         subject = self._subject(db, identity, subject_id, body.purpose_id, "mutation", correlation)
         if body.predicate not in PREDICATES:
@@ -155,30 +171,27 @@ class ClaimService:
         existing_claims = list(db.scalars(select(Claim).where(
             Claim.subject_id == subject.id, Claim.predicate == body.predicate,
             Claim.status.in_(["current", "contested"]))).all())
-        status = "current"
+        status, superseded, contested = "current", [], []
         for old in existing_claims:
             old_value = decrypt(key, old.value_ciphertext, f"{subject.id}:{body.predicate}".encode())
             if old.source_system == body.source.system:
                 if body.source.version > old.source_version:
-                    old.status = "superseded"
+                    old.status = "superseded"; superseded.append(old)
                 elif body.source.version < old.source_version:
                     status = "historical"
                 elif old_value != value_bytes:
-                    old.status = status = "contested"
+                    old.status = status = "contested"; contested.append(old)
                 else:
                     status = "historical"
             elif old_value != value_bytes:
-                old.status = status = "contested"
-        seq = (db.scalar(select(func.max(EventLedger.sequence)).where(EventLedger.subject_id == subject.id)) or 0) + 1
-        previous = db.scalar(select(EventLedger.record_hash).where(EventLedger.subject_id == subject.id).order_by(EventLedger.sequence.desc()).limit(1)) or "0" * 64
+                old.status = status = "contested"; contested.append(old)
         metadata = {"subject_id": subject.id, "tenant_id": identity.tenant_id, "predicate": body.predicate,
                     "claim_class": body.claim_class, "record_kind": body.record_kind, "status": status,
                     "source": body.source.model_dump(), "evidence_id": body.evidence.evidence_id,
                     "evidence_uri": evidence_uri, "evidence_hash": body.evidence.hash.lower(),
                     "purpose_ids": [body.purpose_id], "valid_from": str(body.valid_from), "valid_to": str(body.valid_to),
                     "observed_at": str(body.observed_at), "retention_rule": body.retention_rule,
-                    "confidence_band": body.confidence_band, "event_sequence": seq}
-        record_hash = sha256(ciphertext + canonical(metadata) + previous.encode())
+                    "confidence_band": body.confidence_band}
         claim = Claim(subject_id=subject.id, tenant_id=identity.tenant_id, predicate=body.predicate,
             value_ciphertext=ciphertext, claim_class=body.claim_class, record_kind=body.record_kind, status=status,
             source_system=body.source.system, source_record_id=body.source.record_id,
@@ -187,10 +200,27 @@ class ClaimService:
             purpose_ids=[body.purpose_id], valid_from=as_utc(body.valid_from),
             valid_to=as_utc(body.valid_to) if body.valid_to else None,
             observed_at=as_utc(body.observed_at), retention_rule=body.retention_rule,
-            confidence_band=body.confidence_band, event_sequence=seq, record_hash=record_hash)
+            confidence_band=body.confidence_band, event_sequence=0, record_hash="")
         db.add(claim); db.flush()
-        db.add(EventLedger(tenant_id=identity.tenant_id, subject_id=subject.id, claim_id=claim.id,
-            sequence=seq, ciphertext=ciphertext, metadata_json=metadata, previous_hash=previous, record_hash=record_hash))
+        # Canonical events (F08 design §1.11 / F01 AC8). Every claim gets exactly one of
+        # ClaimProposed (recorded but contested, so not accepted as current) or ClaimAccepted
+        # (current or historical); affected claims then get ClaimSuperseded / ClaimContested.
+        base = {"subject_id": subject.id, "tenant_id": identity.tenant_id, "predicate": body.predicate}
+        if emit_evidence_event:
+            self._append_event(db, identity.tenant_id, subject.id, claim.id, "EvidenceAcquired", b"", {
+                **base, "claim_id": claim.id, "evidence_id": body.evidence.evidence_id, "evidence_uri": evidence_uri,
+                "evidence_hash": body.evidence.hash.lower(), "retention_rule": body.retention_rule})
+        seq, record_hash = self._append_event(db, identity.tenant_id, subject.id, claim.id,
+            "ClaimProposed" if status == "contested" else "ClaimAccepted", ciphertext, metadata)
+        claim.event_sequence, claim.record_hash = seq, record_hash
+        for old in superseded:
+            self._append_event(db, identity.tenant_id, subject.id, old.id, "ClaimSuperseded", b"", {
+                **base, "claim_id": old.id, "superseded_by": claim.id,
+                "source": {"system": old.source_system, "version": old.source_version}})
+        for affected in contested + ([claim] if contested else []):
+            self._append_event(db, identity.tenant_id, subject.id, affected.id, "ClaimContested", b"", {
+                **base, "claim_id": affected.id, "contested_with": [c.id for c in contested + [claim] if c is not affected],
+                "source": {"system": affected.source_system, "version": affected.source_version}})
         result = {"claim_id": claim.id, "subject_id": subject.id, "status": status,
                   "event_sequence": seq, "record_hash": record_hash}
         receipt.claim_id, receipt.response_json = claim.id, result
@@ -429,7 +459,7 @@ class ClaimService:
             key = self.keys.unwrap(subject.id, subject.wrapped_key, subject.key_reference)
             evidence_uri = self.evidence.put(identity.tenant_id, subject.id, evidence_id, content, key)
             results = []
-            for predicate, value in mapped:
+            for index, (predicate, value) in enumerate(mapped):
                 body = ClaimMutation(idempotency_key=batch_key + ":" + predicate,
                     predicate=predicate, value=value, claim_class="authoritative", record_kind="canonical_claim",
                     source={"system": snapshot["source_system_id"], "record_id": record.source_record_id,
@@ -439,8 +469,8 @@ class ClaimService:
                     purpose_id="source_sync", valid_from=record.effective_from,
                     observed_at=record.source_updated_at, retention_rule=self.IMPORT_SNAPSHOT_RETENTION,
                     confidence_band="confirmed")
-                results.append(self._mutate(db, identity, subject.id, body, correlation,
-                                            commit=False, stored_evidence_uri=evidence_uri))
+                results.append(self._mutate(db, identity, subject.id, body, correlation, commit=False,
+                                            stored_evidence_uri=evidence_uri, emit_evidence_event=index == 0))
             if file_evidence_id and not db.get(ImportFileEvidenceSubject, (file_evidence_id, subject.id)):
                 db.add(ImportFileEvidenceSubject(file_evidence_id=file_evidence_id, subject_id=subject.id))
             result = {"subject_id": subject.id, "claims": results, "superseded_claim_ids": superseded,
