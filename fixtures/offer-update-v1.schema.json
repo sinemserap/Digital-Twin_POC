@@ -1,0 +1,149 @@
+{
+  "header": {
+    "additionalProperties": false,
+    "description": "First JSONL line: the file gate.",
+    "properties": {
+      "content_hash": {
+        "pattern": "^[0-9a-f]{64}$",
+        "title": "Content Hash",
+        "type": "string"
+      },
+      "generated_at": {
+        "format": "date-time",
+        "title": "Generated At",
+        "type": "string"
+      },
+      "record_count": {
+        "maximum": 100,
+        "minimum": 1,
+        "title": "Record Count",
+        "type": "integer"
+      },
+      "schema_version": {
+        "const": "1",
+        "title": "Schema Version",
+        "type": "string"
+      },
+      "signature": {
+        "anyOf": [
+          {
+            "pattern": "^[0-9a-f]{64}$",
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Signature"
+      },
+      "snapshot_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Snapshot Id",
+        "type": "string"
+      },
+      "source_system_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Source System Id",
+        "type": "string"
+      },
+      "tenant_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Tenant Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "schema_version",
+      "source_system_id",
+      "tenant_id",
+      "snapshot_id",
+      "generated_at",
+      "record_count",
+      "content_hash"
+    ],
+    "title": "ImportHeader",
+    "type": "object"
+  },
+  "record": {
+    "additionalProperties": false,
+    "description": "One offer/update record. Subject binding is deterministic through source_person_ref.",
+    "properties": {
+      "effective_from": {
+        "format": "date-time",
+        "title": "Effective From",
+        "type": "string"
+      },
+      "event_type": {
+        "enum": [
+          "offer_accepted",
+          "offer_updated"
+        ],
+        "title": "Event Type",
+        "type": "string"
+      },
+      "offer_status": {
+        "const": "accepted",
+        "title": "Offer Status",
+        "type": "string"
+      },
+      "role_ref": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Role Ref",
+        "type": "string"
+      },
+      "source_person_ref": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Source Person Ref",
+        "type": "string"
+      },
+      "source_record_id": {
+        "maxLength": 256,
+        "minLength": 1,
+        "title": "Source Record Id",
+        "type": "string"
+      },
+      "source_updated_at": {
+        "format": "date-time",
+        "title": "Source Updated At",
+        "type": "string"
+      },
+      "source_version": {
+        "maximum": 2147483647,
+        "minimum": 1,
+        "title": "Source Version",
+        "type": "integer"
+      },
+      "start_date": {
+        "format": "date",
+        "title": "Start Date",
+        "type": "string"
+      },
+      "tenant_id": {
+        "maxLength": 128,
+        "minLength": 1,
+        "title": "Tenant Id",
+        "type": "string"
+      }
+    },
+    "required": [
+      "tenant_id",
+      "source_record_id",
+      "source_person_ref",
+      "source_version",
+      "source_updated_at",
+      "event_type",
+      "role_ref",
+      "start_date",
+      "offer_status",
+      "effective_from"
+    ],
+    "title": "OfferRecord",
+    "type": "object"
+  }
+}

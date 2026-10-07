@@ -1,0 +1,14 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: edt
+      POSTGRES_PASSWORD: edt
+      POSTGRES_DB: edt
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U edt"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
