@@ -6,7 +6,9 @@ PREDICATES = (
 AUTHORITATIVE = frozenset(PREDICATES[:9])
 SELF_DECLARED = frozenset(PREDICATES[9:])
 ALLOWED_PURPOSES = {
-    "preboarding_support": ("read", {"support"}),
+    # F01 §1.4: preboarding_support is used by the operator and by F03. The F03 projection
+    # service identity reads accepted state under this purpose (projection_service role).
+    "preboarding_support": ("read", {"support", "projection_service"}),
     "candidate_self_view": ("read", {"candidate"}),
     "source_sync": ("mutation", {"source_service"}),
     "audit_reconstruction": ("read", {"auditor"}),

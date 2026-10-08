@@ -32,35 +32,53 @@ class ClaimService:
                          subject_id=subject, purpose=purpose, operation=operation,
                          outcome=outcome, correlation_id=correlation))
 
-    def authorize(self, db, identity: Identity, purpose: str, operation: str, subject_id: str | None, correlation: str):
+    @staticmethod
+    def purpose_permitted(identity: Identity, purpose: str, operation: str) -> bool:
+        """Pure policy decision shared with derived projections: purpose is registered, not
+        prohibited, bound to this operation and to one of the caller's roles (F01 §1.4)."""
         rule = ALLOWED_PURPOSES.get(purpose)
-        if purpose in DENIED_PURPOSES or not rule or rule[0] != operation or not (identity.roles & rule[1]):
+        return not (purpose in DENIED_PURPOSES or not rule or rule[0] != operation or not (identity.roles & rule[1]))
+
+    def authorize(self, db, identity: Identity, purpose: str, operation: str, subject_id: str | None, correlation: str):
+        if not self.purpose_permitted(identity, purpose, operation):
             self.audit(db, identity, subject_id, purpose, operation, "denied", correlation)
             db.commit()
             raise HTTPException(403, "purpose is not authorized for this identity and endpoint")
 
-    def _subject(self, db, identity, subject_id, purpose, operation, correlation):
+    @staticmethod
+    def subject_access_state(db, identity, subject_id):
+        """Pure read-time subject gate (SELECT only; no audit side effect) shared with derived
+        projections. Returns (state, subject): state is ok | not_found | restricted | erased.
+        A foreign-tenant subject and an unbound candidate are both not_found (no existence signal)."""
         subject = db.scalar(select(Subject).where(Subject.id == subject_id, Subject.tenant_id == identity.tenant_id))
         if not subject:
-            self.audit(db, identity, subject_id, purpose, operation, "denied", correlation)
-            db.commit()
-            raise HTTPException(404, "subject not found")
+            return "not_found", None
         if "candidate" in identity.roles:
             owns = db.scalar(select(SubjectBinding.id).where(
                 SubjectBinding.subject_id == subject_id,
                 SubjectBinding.tenant_id == identity.tenant_id,
                 SubjectBinding.authenticated_account_id == identity.account_id))
             if not owns:
-                self.audit(db, identity, subject_id, purpose, operation, "denied", correlation)
-                db.commit()
-                raise HTTPException(404, "subject not found")
+                return "not_found", None
         # These are CURRENT access conditions, even for a query about the past.
         # Check before selecting payloads, unwrapping a key, or replaying a receipt.
         if subject.restricted:
+            return "restricted", subject
+        if not subject.wrapped_key or not subject.key_reference:
+            return "erased", subject
+        return "ok", subject
+
+    def _subject(self, db, identity, subject_id, purpose, operation, correlation):
+        state, subject = self.subject_access_state(db, identity, subject_id)
+        if state == "not_found":
+            self.audit(db, identity, subject_id, purpose, operation, "denied", correlation)
+            db.commit()
+            raise HTTPException(404, "subject not found")
+        if state == "restricted":
             self.audit(db, identity, subject_id, purpose, operation, "restricted", correlation)
             db.commit()
             raise HTTPException(403, "subject is restricted")
-        if not subject.wrapped_key or not subject.key_reference:
+        if state == "erased":
             self.audit(db, identity, subject_id, purpose, operation, "erased", correlation)
             db.commit()
             raise HTTPException(410, "subject payload has been erased")
@@ -487,6 +505,133 @@ class ClaimService:
         self.audit(db, identity, subject_id, "source_sync", "claim_mutation", "integrity_alert", correlation)
         db.commit()
         raise HTTPException(422, "BINDING_INTEGRITY_ERROR")
+
+
+    # ----- F01 projection contract used by the F03 operational relationship graph -----
+
+    PROJECTION_PURPOSE = "preboarding_support"   # F01 §1.4: "Used by Operator, F03"
+
+    def projection_snapshot(self, identity, predicates, as_of, correlation):
+        """Accepted current canonical state of one tenant for a derived projection (F01 §1.7:
+        "F03 and other projections consume accepted state/events and never write canonical
+        claims directly").
+
+        Returns, per non-restricted / non-erased subject, the single accepted *current* claim
+        per requested predicate (decrypted value plus the full provenance envelope and the
+        ClaimAccepted ledger event), or an exclusion reason that mirrors the current-read
+        contract (contested, expired, not_yet_valid, no_claim). Historical, superseded,
+        contested, proposed and model-output records are never returned. The tenant is the
+        authenticated tenant; `as_of` is the validity instant the claims are evaluated at and
+        is recorded by the caller so the same canonical state always projects identically.
+        """
+        with self.sessions() as db:
+            self.authorize(db, identity, self.PROJECTION_PURPOSE, "read", None, correlation)
+            as_of = as_utc(as_of)
+            subjects = list(db.scalars(select(Subject).where(Subject.tenant_id == identity.tenant_id)
+                                       .order_by(Subject.id)))
+            # Fingerprint of the canonical state that is being projected: every ledger event of the
+            # tenant plus the current rights/erasure state of every subject.
+            ledger_rows = db.execute(select(EventLedger.subject_id, EventLedger.sequence, EventLedger.record_hash)
+                                     .where(EventLedger.tenant_id == identity.tenant_id)
+                                     .order_by(EventLedger.subject_id, EventLedger.sequence)).all()
+            rights_rows = [(s.id, bool(s.restricted), bool(s.wrapped_key and s.key_reference)) for s in subjects]
+            fingerprint = sha256(canonical({"ledger": [list(r) for r in ledger_rows], "rights": rights_rows}))
+            included, excluded = [], []
+            for subject in subjects:
+                if subject.restricted:
+                    excluded.append({"subject_id": subject.id, "reason": "restricted"}); continue
+                if not subject.wrapped_key or not subject.key_reference:
+                    excluded.append({"subject_id": subject.id, "reason": "erased"}); continue
+                binding = db.scalar(select(SubjectBinding).where(SubjectBinding.subject_id == subject.id)
+                                    .order_by(SubjectBinding.id))
+                key = self.keys.unwrap(subject.id, subject.wrapped_key, subject.key_reference)
+                claims_out = {}
+                for predicate in predicates:
+                    if predicate not in PREDICATES:
+                        raise HTTPException(422, f"unknown predicate {predicate}")
+                    claims = list(db.scalars(select(Claim).where(
+                        Claim.subject_id == subject.id, Claim.predicate == predicate,
+                        Claim.status.in_(["current", "contested"])).order_by(Claim.id)))
+                    if not claims:
+                        claims_out[predicate] = {"state": "excluded", "reason": "no_claim", "claim_ids": []}
+                        continue
+                    if any(c.status == "contested" for c in claims) or len(claims) > 1:
+                        claims_out[predicate] = {"state": "excluded", "reason": "contested",
+                                                 "claim_ids": [c.id for c in claims]}
+                        continue
+                    c = claims[0]
+                    if c.valid_to and as_utc(c.valid_to) <= as_of:
+                        claims_out[predicate] = {"state": "excluded", "reason": "expired", "claim_ids": [c.id]}
+                        continue
+                    if as_utc(c.valid_from) > as_of:
+                        claims_out[predicate] = {"state": "excluded", "reason": "not_yet_valid", "claim_ids": [c.id]}
+                        continue
+                    accepted = db.scalar(select(EventLedger).where(
+                        EventLedger.claim_id == c.id, EventLedger.sequence == c.event_sequence))
+                    related = list(db.scalars(select(EventLedger).where(
+                        EventLedger.claim_id == c.id, EventLedger.sequence != c.event_sequence,
+                        EventLedger.event_type.in_(["PreboardingDependencyBlocked", "PreboardingDependencyResolved"]))
+                        .order_by(EventLedger.sequence)))
+                    value = json.loads(decrypt(key, c.value_ciphertext, f"{subject.id}:{predicate}".encode()))
+                    claims_out[predicate] = {
+                        "state": "accepted", "value": value, "claim_id": c.id, "claim_class": c.claim_class,
+                        "record_kind": c.record_kind, "status": c.status,
+                        "source_system": c.source_system, "source_record_id": c.source_record_id,
+                        "source_authority": c.source_authority, "source_version": c.source_version,
+                        "evidence_id": c.evidence_id, "evidence_hash": c.evidence_hash, "evidence_uri": c.evidence_uri,
+                        "valid_from": as_utc(c.valid_from).isoformat(),
+                        "valid_to": as_utc(c.valid_to).isoformat() if c.valid_to else None,
+                        "confidence_band": c.confidence_band, "retention_rule": c.retention_rule,
+                        "event": {"event_id": accepted.id, "event_type": accepted.event_type,
+                                  "event_sequence": accepted.sequence, "record_hash": accepted.record_hash}
+                                 if accepted else None,
+                        "related_events": [{"event_id": e.id, "event_type": e.event_type,
+                                            "event_sequence": e.sequence, "record_hash": e.record_hash,
+                                            "metadata": e.metadata_json} for e in related],
+                    }
+                included.append({"subject_id": subject.id, "bound_account": bool(binding and binding.authenticated_account_id),
+                                 "source_system": binding.source_system if binding else None,
+                                 "source_person_ref": binding.source_person_ref if binding else None,
+                                 "ledger_watermark": self.subject_ledger_watermark(db, subject.id),
+                                 "claims": claims_out})
+            self.audit(db, identity, None, self.PROJECTION_PURPOSE, "projection_snapshot", "allowed", correlation)
+            db.commit()
+            return {"tenant_id": identity.tenant_id, "as_of": as_of.isoformat(),
+                    "canonical_fingerprint": fingerprint, "canonical_event_count": len(ledger_rows),
+                    "subjects": included, "excluded_subjects": excluded}
+
+    @staticmethod
+    def subject_ledger_watermark(db, subject_id):
+        return db.scalar(select(func.max(EventLedger.sequence)).where(EventLedger.subject_id == subject_id)) or 0
+
+
+class F01ProjectionContract:
+    """The only F01 surface handed to the F03 graph service.
+
+    Read-only by construction: the accepted-state snapshot (runs on F01's own sessions under the
+    projection identity), plus three pure policy/read helpers that F03 evaluates on its own
+    read-only connection: purpose decision, subject gate and ledger watermark. No session
+    factory, no claim/ledger/evidence writers, no audit writer (F03 keeps its own audit table).
+    """
+    __slots__ = ("_service",)
+
+    def __init__(self, service: ClaimService):
+        self._service = service
+
+    def snapshot(self, identity, predicates, as_of, correlation):
+        return self._service.projection_snapshot(identity, predicates, as_of, correlation)
+
+    @staticmethod
+    def purpose_permitted(identity, purpose, operation):
+        return ClaimService.purpose_permitted(identity, purpose, operation)
+
+    @staticmethod
+    def subject_access_state(db, identity, subject_id):
+        return ClaimService.subject_access_state(db, identity, subject_id)
+
+    @staticmethod
+    def ledger_watermark(db, subject_id):
+        return ClaimService.subject_ledger_watermark(db, subject_id)
 
 
 class F01ImportContract:
