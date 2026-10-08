@@ -239,6 +239,16 @@ class ClaimService:
             self._append_event(db, identity.tenant_id, subject.id, affected.id, "ClaimContested", b"", {
                 **base, "claim_id": affected.id, "contested_with": [c.id for c in contested + [claim] if c is not affected],
                 "source": {"system": affected.source_system, "version": affected.source_version}})
+        # F01-EXT-01 (PENDING APPROVAL, decision D-04): when a preboarding_dependency_status claim is
+        # accepted as current, F01 derives the v3.1 §18 domain events PreboardingDependencyBlocked /
+        # PreboardingDependencyResolved deterministically from the accepted value and appends them to
+        # the same hash-chained ledger, so that F03 AC05 can reference a canonical accepted event.
+        # Only opaque references and reason codes enter the event metadata; no event is emitted for
+        # historical or contested claims, and an unparseable value emits nothing.
+        if body.predicate == "preboarding_dependency_status" and status == "current":
+            for event_type, meta in self._dependency_events(body.value):
+                self._append_event(db, identity.tenant_id, subject.id, claim.id, event_type, b"",
+                                   {**base, "claim_id": claim.id, **meta})
         result = {"claim_id": claim.id, "subject_id": subject.id, "status": status,
                   "event_sequence": seq, "record_hash": record_hash}
         receipt.claim_id, receipt.response_json = claim.id, result
@@ -246,6 +256,22 @@ class ClaimService:
         db.commit() if commit else db.flush()
         return result
 
+
+    @staticmethod
+    def _dependency_events(value):
+        from .dependency_schema import InvalidDependencyValue, normalize_dependencies
+        try:
+            dependencies = normalize_dependencies(value)
+        except InvalidDependencyValue:
+            return []
+        events = []
+        for dep in dependencies:
+            if dep["status"] == "blocked":
+                events.append(("PreboardingDependencyBlocked", {"task_ref": dep["task_ref"],
+                               "blocked_by_ref": dep["blocked_by"], "reason_code": dep["reason_code"]}))
+            elif dep["status"] == "resolved":
+                events.append(("PreboardingDependencyResolved", {"task_ref": dep["task_ref"]}))
+        return events
 
     def _reject(self, db, identity, subject, purpose, correlation, code, detail, commit=True):
         self.audit(db, identity, subject, purpose, "claim_mutation", "rejected", correlation)
