@@ -65,6 +65,7 @@ def postgres_database(postgres_schema):
         apply_migration(engine, "001_initial.sql")
         apply_migration(engine, "002_subject_restriction.sql")
         apply_migration(engine, "003_controlled_import.sql")
+        apply_migration(engine, "004_operational_graph.sql")
     finally:
         engine.dispose()
     return postgres_schema
