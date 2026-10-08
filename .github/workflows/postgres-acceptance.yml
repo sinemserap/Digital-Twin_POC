@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - codex/build-employee-digital-twin-poc-part-1
+      - f03-operational-graph-part1
 
 permissions:
   contents: read
@@ -46,3 +47,18 @@ jobs:
           python -m pytest
           --postgres-url postgresql+psycopg://edt:edt@localhost:5432/edt_test
           --postgres-timezone ${{ matrix.timezone }}
+      - name: F03 deployed-service demonstration (uvicorn + migrated PostgreSQL + restricted roles)
+        if: matrix.timezone == 'UTC'
+        env:
+          PGPASSWORD: edt
+        run: |
+          createdb -h localhost -U edt edt_demo
+          for f in 001_initial 002_subject_restriction 003_controlled_import 004_operational_graph compose_roles; do
+            psql -q -h localhost -U edt -d edt_demo -v ON_ERROR_STOP=1 -f migrations/$f.sql
+          done
+          DATABASE_URL=postgresql+psycopg://edt:edt@localhost:5432/edt_demo \
+          IMPORT_DATABASE_URL=postgresql+psycopg://edt_f08:edt_f08@localhost:5432/edt_demo \
+          GRAPH_DATABASE_URL=postgresql+psycopg://edt_f03:edt_f03@localhost:5432/edt_demo \
+          EVIDENCE_DIR=/tmp/evidence python -m app &
+          for i in $(seq 1 30); do curl -sf localhost:8000/health && break; sleep 1; done
+          BASE_URL=http://localhost:8000 bash scripts/demo_f03.sh

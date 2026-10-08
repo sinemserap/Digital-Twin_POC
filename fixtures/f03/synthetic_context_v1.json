@@ -1,0 +1,40 @@
+{
+  "description": "Synthetic F03 Part 1 fixtures (US40852). No real candidate data. offered_role for every candidate arrives through the real F08 JSONL import (fixtures/f03/offer-update-f03.jsonl). org_unit / manager_or_sponsor (HR) and preboarding_dependency_status (ITSM) are admitted through the F01 mutation contract (POST /subjects/{id}/claims, purpose source_sync) because no F08 adapter exists for those sources in Part 1 (F08 D11).",
+  "tenant_id": "tenant-a",
+  "candidates": [
+    {
+      "source_person_ref": "synthetic-f03-001",
+      "account_id": "candidate-001",
+      "claims": [
+        {"predicate": "org_unit", "source": "HR", "record_id": "hr-ou-001", "version": 1,
+         "value": {"unit_ref": "DWP-RND", "label": "Digital Workplace R&D"}},
+        {"predicate": "manager_or_sponsor", "source": "HR", "record_id": "hr-mgr-001", "version": 1,
+         "value": {"contact_ref": "mgr-1001", "relationship": "manager", "label": "Engineering Manager (synthetic)"}},
+        {"predicate": "preboarding_dependency_status", "source": "ITSM", "record_id": "itsm-dep-001", "version": 1,
+         "value": {"dependencies": [
+           {"task_ref": "TASK-LAPTOP-001", "label": "Laptop provisioning", "status": "blocked",
+            "blocked_by": {"task_ref": "REQ-ACCOUNT-001", "label": "Directory account creation"},
+            "reason_code": "DEP_NOT_RESOLVED", "reason": "Account request is waiting for HR record activation"},
+           {"task_ref": "TASK-BADGE-001", "label": "Access badge", "status": "open"}]}}
+      ]
+    },
+    {
+      "source_person_ref": "synthetic-f03-002",
+      "account_id": "candidate-002",
+      "claims": [
+        {"predicate": "org_unit", "source": "HR", "record_id": "hr-ou-002", "version": 1,
+         "value": {"unit_ref": "CLOUD-OPS", "label": "Cloud Operations"}},
+        {"predicate": "manager_or_sponsor", "source": "HR", "record_id": "hr-mgr-002", "version": 1,
+         "value": {"contact_ref": "mgr-1001", "relationship": "manager", "label": "Engineering Manager (synthetic)"}},
+        {"predicate": "preboarding_dependency_status", "source": "ITSM", "record_id": "itsm-dep-002", "version": 1,
+         "value": {"dependencies": [
+           {"task_ref": "TASK-LAPTOP-002", "label": "Laptop provisioning", "status": "in_progress"}]}}
+      ]
+    },
+    {
+      "source_person_ref": "synthetic-f03-003",
+      "account_id": "candidate-003",
+      "claims": []
+    }
+  ]
+}

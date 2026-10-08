@@ -6,9 +6,31 @@ services:
       POSTGRES_PASSWORD: edt
       POSTGRES_DB: edt
     ports: ["5432:5432"]
+    volumes:
+      # Reference migrations run once on an empty volume (001..004 + the F08/F03 role grants).
+      - ./migrations/001_initial.sql:/docker-entrypoint-initdb.d/001_initial.sql:ro
+      - ./migrations/002_subject_restriction.sql:/docker-entrypoint-initdb.d/002_subject_restriction.sql:ro
+      - ./migrations/003_controlled_import.sql:/docker-entrypoint-initdb.d/003_controlled_import.sql:ro
+      - ./migrations/004_operational_graph.sql:/docker-entrypoint-initdb.d/004_operational_graph.sql:ro
+      - ./migrations/compose_roles.sql:/docker-entrypoint-initdb.d/900_compose_roles.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U edt"]
       interval: 2s
       timeout: 2s
       retries: 15
 
+  api:
+    build: .
+    image: edt-poc-service:f03-part1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # F01 service identity (only writer of canonical state).
+      DATABASE_URL: postgresql+psycopg://edt:edt@postgres:5432/edt
+      # F08 adapter identity: four import tables only (migrations/f08_adapter_role.sql).
+      IMPORT_DATABASE_URL: postgresql+psycopg://edt_f08:edt_f08@postgres:5432/edt
+      # F03 graph identity: graph_* read-write, subject/subject_binding/event_ledger read-only (f03_graph_role.sql).
+      GRAPH_DATABASE_URL: postgresql+psycopg://edt_f03:edt_f03@postgres:5432/edt
+      EVIDENCE_DIR: /srv/edt/.evidence
+    ports: ["8000:8000"]
