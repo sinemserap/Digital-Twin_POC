@@ -303,3 +303,80 @@ skipped); migrated PostgreSQL 16 **84 passed** in both UTC and America/New_York 
 The same PostgreSQL workflow runs on every pull request. Not covered by this slice: Azure
 Blob/Key Vault execution, a real malware scanner, F02/F07 orchestration of the retention
 and erasure hooks, API/event adapters and offer withdrawal.
+
+
+## F03 Operational Relationship Graph — Part 1 (US40852)
+
+A deployed graph service that projects accepted F01 canonical claims into typed nodes and
+edges with provenance, serves exactly two server-side query templates, and can be dropped and
+rebuilt deterministically. It never writes canonical data: the service receives only the
+read-only `F01ProjectionContract` (the F03 counterpart of `F01ImportContract`) and, in
+deployment, its own database identity (`GRAPH_DATABASE_URL`, grants in
+`migrations/f03_graph_role.sql`: read-only on `subject`, `subject_binding`, `event_ledger`;
+read-write on the five `graph_*` tables only, no access to `claim`).
+
+**Ontology (`app/graph/ontology.py`) — PROPOSED, pending Design Authority (`docs/F03_decisions.md`, D-01).**
+No six-node/seven-relationship ontology exists in EDT v3.1, F01 or F08; the five relationship
+names in F01 §1.1 "Needed by" are the only agreed input. The registry is closed (exactly six node
+types and seven edge types; anything else is rejected) and the projection, templates and tests
+are registry-driven, so an approved change is a change to that file only.
+
+| Node | Key | Source | Edge | From → To | F01 predicate (authority) |
+|---|---|---|---|---|---|
+| Person | subject_id | F01 subject | OFFERED_ROLE | Person → Role | offered_role (ATS, via F08) |
+| Role | role_ref | offered_role | IN_UNIT | Person → OrgUnit | org_unit (HR/directory) |
+| OrgUnit | unit_ref | org_unit | ROLE_IN_UNIT | Role → OrgUnit, subject-scoped | org_unit (HR/directory) |
+| Contact | contact_ref | manager_or_sponsor | HAS_CONTACT | Person → Contact | manager_or_sponsor (HR/directory) |
+| Task | task_ref | preboarding_dependency_status | HAS_DEPENDENCY | Person → Task | preboarding_dependency_status (ITSM) |
+| Evidence | subject:evidence_id | claim.evidence_* | BLOCKED_BY | Task → Task (+reason) | preboarding_dependency_status (ITSM) |
+| | | | EVIDENCED_BY | Person → Evidence | the contributing claim |
+
+Every edge carries `claim_id`, `event_id`/`event_type`/`event_sequence`/`event_hash` of the
+ClaimAccepted ledger entry, `source_system`, `source_record_id`, `source_version`,
+`evidence_id`/`evidence_hash`/`evidence_uri`, `valid_from`/`valid_to`, `projection_version` and
+`allowed_purposes`, plus the owning `subject_id`. Only `record_kind=canonical_claim`,
+`claim_class=authoritative`, `status=current` claims from the predicate's authoritative source,
+valid at the projection `as_of` instant and with exactly one current claim per predicate are
+projected; everything else is recorded in `graph_rejection` with a reason code and no values.
+
+### API (`/graph/v1`, OpenAPI at `/openapi.json`)
+
+```bash
+# full deterministic rebuild for the caller's tenant (role graph_administrator)
+curl -s -X POST localhost:8000/graph/v1/projections/rebuild -H 'X-Tenant-ID: demo' -H 'X-Account-ID: admin' -H 'X-Roles: graph_administrator'
+# Template A: role context (Person -OFFERED_ROLE-> Role -ROLE_IN_UNIT-> OrgUnit, plus IN_UNIT / HAS_CONTACT context)
+curl -s 'localhost:8000/graph/v1/subjects/{id}/role-context?purpose=candidate_self_view' -H 'X-Tenant-ID: demo' -H 'X-Account-ID: candidate-001' -H 'X-Roles: candidate'
+# Template B: blocker explanation (Person -HAS_DEPENDENCY-> Task -BLOCKED_BY-> Task + PreboardingDependencyBlocked event)
+curl -s 'localhost:8000/graph/v1/subjects/{id}/blocker-explanation?purpose=preboarding_support' -H 'X-Tenant-ID: demo' -H 'X-Account-ID: support-1' -H 'X-Roles: support'
+# dry-run re-projection compared with the active projection (AC10 evidence)
+curl -s -X POST localhost:8000/graph/v1/projections/verify -H 'X-Tenant-ID: demo' -H 'X-Account-ID: admin' -H 'X-Roles: graph_administrator'
+```
+
+Only `purpose` is accepted as a parameter; any other query parameter, any request body and any
+unregistered template path is refused (422/404) and audited. Purpose is validated against the
+F01 purpose registry and the caller's role (a candidate cannot request `preboarding_support`),
+then against the template, then the subject gate (tenant, candidate binding, current
+restriction, erasure) runs on read-only canonical tables, and finally every hop re-checks
+tenant, subject and purpose on the edge and both nodes. Foreign-tenant, other-candidate and
+unknown subjects all return the same `404 {"detail": "subject not found"}`. Responses carry
+`stale=true` when the subject's ledger has moved past the projected watermark; incremental
+invalidation itself is US41278.
+
+Every request is written to `graph_query_audit` (actor, tenant, subject, purpose, template,
+outcome, HTTP status, request hash, response digest, returned edge ids, correlation id); the
+F01 projection read is audited in `audit_log` under the `f03-projection` identity.
+
+### Run, test, demonstrate
+
+```bash
+docker compose up --build            # postgres (migrations 001-004 + roles) and the api on :8000
+BASE_URL=http://localhost:8000 scripts/demo_f03.sh   # F08 import -> F01 claims -> rebuild -> both templates -> denials -> identical rebuild
+python -m pytest tests/test_graph.py                  # G01-G34 on SQLite; add --postgres-url for the migrated PostgreSQL run
+```
+
+Local validation on 8 October 2026: SQLite **122 passed** (F01 78 + F03 44; 7 PostgreSQL-only
+skipped); migrated PostgreSQL 16.15 **129 passed** in both UTC and America/New_York sessions,
+including the F03 role-boundary test; `scripts/demo_f03.sh` executed against uvicorn with the
+three database identities (`edt`, `edt_f08`, `edt_f03`) — identical graph hash across rebuilds.
+Not covered: deployment to the Azure PoC environment (Dockerfile/compose provided; no
+credentials here), Apache AGE (DA-10 open), US41278 incremental invalidation.
